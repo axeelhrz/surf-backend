@@ -4,7 +4,6 @@ python-multipart==0.0.6
 numpy==1.24.3
 opencv-python>=4.10.0
 tensorflow==2.13.0
-keras==2.13.0
 deepface==0.0.67
 scipy==1.11.4
 Pillow>=10.2.0
