@@ -96,7 +96,8 @@ def read_image_to_array(file: UploadFile) -> np.ndarray:
 
 def detect_face(image: np.ndarray) -> bool:
     """
-    Detecta si hay un rostro en la imagen usando OpenCV.
+    Detecta si hay un rostro en la imagen usando DeepFace.
+    DeepFace es más flexible que OpenCV Cascade Classifier.
     
     Args:
         image: Imagen como array numpy
@@ -105,18 +106,15 @@ def detect_face(image: np.ndarray) -> bool:
         bool: True si se detecta rostro, False en caso contrario
     """
     try:
-        # Cargar clasificador de cascada para detección de rostros
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        # Usar DeepFace para detectar rostros (más flexible que OpenCV)
+        # Si enforce_detection=False, intentará extraer embedding incluso sin detección clara
+        embedding_objs = DeepFace.represent(
+            img_path=image,
+            model_name=MODEL_NAME,
+            enforce_detection=False  # Más flexible
         )
         
-        # Convertir a escala de grises
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Detectar rostros
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-        
-        return len(faces) > 0
+        return len(embedding_objs) > 0
     
     except Exception as e:
         logger.error(f"Error en detección de rostro: {str(e)}")
