@@ -1,5 +1,5 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 numpy==1.24.3
 opencv-python>=4.10.0
@@ -9,3 +9,4 @@ scipy==1.11.4
 Pillow>=10.2.0
 setuptools>=70.0.0
 wheel>=0.43.0
+typing-extensions==4.5.0
