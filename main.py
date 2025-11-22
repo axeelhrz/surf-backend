@@ -148,13 +148,22 @@ def extract_face_embedding(image: np.ndarray) -> np.ndarray:
         # Obtener el primer embedding (rostro principal)
         embedding_obj = embedding_objs[0]
         
-        # Verificar si es un diccionario o si el embedding está directamente en la respuesta
+        # DeepFace retorna un diccionario con la clave "embedding"
         if isinstance(embedding_obj, dict):
-            embedding = np.array(embedding_obj.get("embedding", embedding_obj))
+            # Extraer el embedding del diccionario
+            embedding_list = embedding_obj.get("embedding")
+            if embedding_list is None:
+                raise ValueError("No se encontró 'embedding' en la respuesta")
+            embedding = np.array(embedding_list, dtype=np.float32)
         else:
-            embedding = np.array(embedding_obj)
+            # Si no es diccionario, convertir directamente
+            embedding = np.array(embedding_obj, dtype=np.float32)
         
-        logger.info(f"Embedding extraído: dimensiones {embedding.shape}")
+        # Validar que el embedding sea 1D
+        if embedding.ndim != 1:
+            embedding = embedding.flatten()
+        
+        logger.info(f"Embedding extraído: dimensiones {embedding.shape}, tipo {type(embedding)}")
         return embedding
     
     except Exception as e:
