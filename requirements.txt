@@ -2,7 +2,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-multipart==0.0.6
 numpy>=1.26.0
-opencv-python-headless>=4.10.0
+opencv-python>=4.10.0
 deepface==0.0.75
 scipy>=1.14.0
 Pillow>=10.2.0
