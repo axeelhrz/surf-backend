@@ -148,7 +148,13 @@ def extract_face_embedding(image: np.ndarray) -> np.ndarray:
             raise ValueError("No se detectó rostro en la imagen")
         
         # Obtener el primer embedding (rostro principal)
-        embedding = np.array(embedding_objs[0]["embedding"])
+        embedding_obj = embedding_objs[0]
+        
+        # Verificar si es un diccionario o si el embedding está directamente en la respuesta
+        if isinstance(embedding_obj, dict):
+            embedding = np.array(embedding_obj.get("embedding", embedding_obj))
+        else:
+            embedding = np.array(embedding_obj)
         
         logger.info(f"Embedding extraído: dimensiones {embedding.shape}")
         return embedding
