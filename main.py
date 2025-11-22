@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 # Configuración
-SIMILARITY_THRESHOLD = 0.60  # Umbral de similitud (0-1) - Detecta coincidencias desde 60%
+SIMILARITY_THRESHOLD = 0.40  # Umbral de similitud (0-1) - Detecta coincidencias desde 40%
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "bmp"}
 MODEL_NAME = "Facenet"  # Modelo de reconocimiento facial
@@ -290,11 +290,14 @@ async def compare_faces(
                 # Calcular similitud
                 similarity = calculate_similarity(selfie_embedding, photo_embedding)
                 
+                # Convertir threshold a porcentaje para comparación
+                threshold_percentage = SIMILARITY_THRESHOLD * 100
+                
                 # DEBUG: Log de similitud
-                logger.info(f"  DEBUG: similarity={similarity}, threshold=60, match={similarity >= 60.0}")
+                logger.info(f"  DEBUG: similarity={similarity}, threshold={threshold_percentage}, match={similarity >= threshold_percentage}")
                 
                 # Clasificar como coincidencia o no
-                if similarity >= 60.0:
+                if similarity >= threshold_percentage:
                     matches.append({
                         "file": photo.filename,
                         "similarity": similarity
