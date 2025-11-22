@@ -15,3 +15,8 @@ venv/
 README.md
 .pytest_cache
 .mypy_cache
+.idea
+.vscode
+Procfile
+runtime.txt
+.railwayignore
