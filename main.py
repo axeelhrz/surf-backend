@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
-import io
 from deepface import DeepFace
 from scipy.spatial.distance import cosine
 import logging
@@ -138,13 +137,9 @@ def extract_face_embedding(image: np.ndarray) -> np.ndarray:
         ValueError: Si no se puede extraer el embedding
     """
     try:
-        # Guardar imagen temporalmente en memoria
-        _, buffer = cv2.imencode(".jpg", image)
-        img_bytes = io.BytesIO(buffer)
-        
-        # Extraer embedding usando DeepFace
+        # Extraer embedding usando DeepFace directamente con el array numpy
         embedding_objs = DeepFace.represent(
-            img_path=img_bytes,
+            img_path=image,
             model_name=MODEL_NAME,
             enforce_detection=True
         )
