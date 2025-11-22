@@ -148,12 +148,20 @@ def extract_face_embedding(image: np.ndarray) -> np.ndarray:
         # Obtener el primer embedding (rostro principal)
         embedding_obj = embedding_objs[0]
         
+        logger.info(f"DEBUG - Tipo de embedding_obj: {type(embedding_obj)}")
+        logger.info(f"DEBUG - Contenido embedding_obj: {embedding_obj}")
+        
         # DeepFace retorna un diccionario con la clave "embedding"
         if isinstance(embedding_obj, dict):
             # Extraer el embedding del diccionario
             embedding_list = embedding_obj.get("embedding")
             if embedding_list is None:
+                logger.error(f"DEBUG - Claves disponibles: {embedding_obj.keys()}")
                 raise ValueError("No se encontró 'embedding' en la respuesta")
+            
+            logger.info(f"DEBUG - Tipo de embedding_list: {type(embedding_list)}")
+            logger.info(f"DEBUG - Longitud de embedding_list: {len(embedding_list) if isinstance(embedding_list, (list, tuple)) else 'N/A'}")
+            
             embedding = np.array(embedding_list, dtype=np.float32)
         else:
             # Si no es diccionario, convertir directamente
@@ -162,6 +170,10 @@ def extract_face_embedding(image: np.ndarray) -> np.ndarray:
         # Validar que el embedding sea 1D
         if embedding.ndim != 1:
             embedding = embedding.flatten()
+        
+        # Validar que tenga al menos 128 dimensiones
+        if embedding.shape[0] < 128:
+            logger.warning(f"Embedding tiene solo {embedding.shape[0]} dimensiones, esperaba 128")
         
         logger.info(f"Embedding extraído: dimensiones {embedding.shape}, tipo {type(embedding)}")
         return embedding
