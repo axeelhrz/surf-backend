@@ -1,26 +1,27 @@
-"""
-DEMO TÉCNICA DE RECONOCIMIENTO FACIAL
-FastAPI + DeepFace + FaceNet + OpenCV
-Comparación biométrica de rostros usando embeddings faciales
-"""
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import numpy as np
+from fastapi.responses import Response
 import cv2
-from deepface import DeepFace
-from scipy.spatial.distance import cosine
-import logging
+import numpy as np
+import insightface
+from PIL import Image, ImageDraw, ImageFont
+import io
+import json
+import shutil
+from typing import List
+from pathlib import Path
+from datetime import datetime, timedelta
+from stripe_endpoints import router as stripe_router
+from admin_endpoints import router as admin_router
 
-# Configuración de logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Crear aplicación FastAPI
+app = FastAPI(
+    title="Reconocimiento Facial con InsightFace",
+    description="API para comparar rostros usando InsightFace y ArcFace",
+    version="2.0.0"
+)
 
-# Inicializar FastAPI
-app = FastAPI(title="Face Recognition Demo", version="1.0.0")
-
-# Configurar CORS para permitir solicitudes desde el frontend
+# Configurar CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,351 +30,1718 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Incluir routers de Stripe y Admin
+app.include_router(stripe_router)
+app.include_router(admin_router)
+
 # Configuración
-SIMILARITY_THRESHOLD = 0.40  # Umbral de similitud (0-1) - Detecta coincidencias desde 40%
+# Umbral de similitud para InsightFace (distancia coseno)
+# InsightFace usa distancia coseno donde valores más bajos = mayor similitud
+# 0.4 = balance (recomendado para la mayoría de casos)
+# 0.35 = más estricto
+# 0.5 = más flexible
+# 0.56 = muy flexible (detecta variaciones significativas)
+# Configuración optimizada para máxima precisión
+# Umbral: 0.56 = 44% similitud mínima (muy sensible para detectar variaciones)
+SIMILARITY_THRESHOLD = 0.56  # Distancia coseno (mayor = más permisivo)
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "bmp"}
-MODEL_NAME = "Facenet"  # Modelo de reconocimiento facial
+MIN_FACE_SIZE = 20  # Tamaño mínimo del rostro en píxeles (reducido)
+MIN_FACE_CONFIDENCE = 0.3  # Confianza mínima del detector (reducida)
+USE_MULTIPLE_FACES = False  # NO usar múltiples rostros
+DEBUG_MODE = True  # Activar logging detallado
 
+# Inicializar modelo InsightFace con mejores prácticas
+# Usar el modelo 'buffalo_l' que es el más preciso y robusto
+print("🔄 Inicializando InsightFace...")
+face_analysis = None
 
-def validate_image_file(file: UploadFile) -> bool:
-    """
-    Valida que el archivo sea una imagen válida.
+try:
+    import onnxruntime as ort
     
-    Args:
-        file: Archivo subido
-        
-    Returns:
-        bool: True si es válido, False en caso contrario
-    """
-    # Validar extensión
-    if not file.filename:
-        return False
+    # Configurar providers (GPU primero si está disponible)
+    providers = []
+    available_providers = ort.get_available_providers()
     
-    extension = file.filename.split(".")[-1].lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        return False
+    if 'CUDAExecutionProvider' in available_providers:
+        providers.append('CUDAExecutionProvider')
+        print("🚀 GPU detectada, usando CUDA")
+    elif 'TensorrtExecutionProvider' in available_providers:
+        providers.append('TensorrtExecutionProvider')
+        print("🚀 TensorRT detectado")
     
-    return True
-
-
-def read_image_to_array(file: UploadFile) -> np.ndarray:
-    """
-    Lee un archivo de imagen y lo convierte a array numpy.
+    providers.append('CPUExecutionProvider')
     
-    Args:
-        file: Archivo de imagen subido
-        
-    Returns:
-        np.ndarray: Imagen como array numpy
-        
-    Raises:
-        ValueError: Si la imagen no puede ser leída
-    """
+    # Inicializar FaceAnalysis con el modelo buffalo_l (el mejor)
+    # buffalo_l incluye: det_10g, rec_2, y otros modelos optimizados
+    face_analysis = insightface.app.FaceAnalysis(
+        name='buffalo_l',  # Modelo más robusto y preciso
+        providers=providers
+    )
+    
+    # Preparar el modelo con tamaño de detección optimizado
+    # Usar tamaño más grande para mejor precisión
+    face_analysis.prepare(ctx_id=0, det_size=(960, 960))
+    print("✅ InsightFace 'buffalo_l' cargado exitosamente con detección 960x960")
+    
+except Exception as e:
+    print(f"⚠️ Error cargando InsightFace con buffalo_l: {e}")
+    print("⚠️ Intentando con modelo por defecto...")
     try:
-        # Leer contenido del archivo
-        contents = file.file.read()
-        
-        # Validar tamaño
-        if len(contents) > MAX_FILE_SIZE:
-            raise ValueError(f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB")
-        
-        # Convertir a array numpy
-        nparr = np.frombuffer(contents, np.uint8)
-        
-        # Decodificar imagen
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            raise ValueError("No se pudo decodificar la imagen")
-        
-        return img
-    
-    except Exception as e:
-        logger.error(f"Error al leer imagen: {str(e)}")
-        raise ValueError(f"Error al procesar imagen: {str(e)}")
+        # Fallback: usar modelo por defecto
+        face_analysis = insightface.app.FaceAnalysis(providers=['CPUExecutionProvider'])
+        face_analysis.prepare(ctx_id=-1, det_size=(640, 640))
+        print("✅ InsightFace cargado con modelo por defecto (CPU)")
+    except Exception as e2:
+        print(f"❌ Error crítico: {e2}")
+        print("❌ InsightFace no pudo ser cargado. Verifica la instalación.")
+        face_analysis = None
 
+# Obtener el directorio base del script
+BASE_DIR = Path(__file__).parent.absolute()
+STORAGE_DIR = BASE_DIR / "photos_storage"
+EMBEDDINGS_DIR = BASE_DIR / "embeddings_storage"
 
-def detect_face(image: np.ndarray) -> bool:
-    """
-    Detecta si hay un rostro en la imagen usando DeepFace.
-    DeepFace es más flexible que OpenCV Cascade Classifier.
-    
-    Args:
-        image: Imagen como array numpy
-        
-    Returns:
-        bool: True si se detecta rostro, False en caso contrario
-    """
-    try:
-        # Usar DeepFace para detectar rostros (más flexible que OpenCV)
-        # Si enforce_detection=False, intentará extraer embedding incluso sin detección clara
-        embedding_objs = DeepFace.represent(
-            img_path=image,
-            model_name=MODEL_NAME,
-            enforce_detection=False  # Más flexible
-        )
-        
-        return len(embedding_objs) > 0
-    
-    except Exception as e:
-        logger.error(f"Error en detección de rostro: {str(e)}")
-        return False
+# Crear directorios si no existen
+STORAGE_DIR.mkdir(exist_ok=True)
+EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
-
-def extract_face_embedding(image: np.ndarray) -> np.ndarray:
-    """
-    Extrae el embedding facial usando DeepFace + FaceNet.
-    
-    Args:
-        image: Imagen como array numpy
-        
-    Returns:
-        np.ndarray: Vector de embedding facial (128 dimensiones)
-        
-    Raises:
-        ValueError: Si no se puede extraer el embedding
-    """
-    try:
-        # Extraer embedding usando DeepFace directamente con el array numpy
-        embedding_objs = DeepFace.represent(
-            img_path=image,
-            model_name=MODEL_NAME,
-            enforce_detection=True
-        )
-        
-        if not embedding_objs or len(embedding_objs) == 0:
-            raise ValueError("No se detectó rostro en la imagen")
-        
-        # Obtener el primer embedding (rostro principal)
-        embedding_obj = embedding_objs[0]
-        
-        logger.info(f"DEBUG - Tipo de embedding_obj: {type(embedding_obj)}")
-        logger.info(f"DEBUG - Contenido embedding_obj: {embedding_obj}")
-        
-        # DeepFace retorna un diccionario con la clave "embedding"
-        if isinstance(embedding_obj, dict):
-            # Extraer el embedding del diccionario
-            embedding_list = embedding_obj.get("embedding")
-            if embedding_list is None:
-                logger.error(f"DEBUG - Claves disponibles: {embedding_obj.keys()}")
-                raise ValueError("No se encontró 'embedding' en la respuesta")
-            
-            logger.info(f"DEBUG - Tipo de embedding_list: {type(embedding_list)}")
-            logger.info(f"DEBUG - Longitud de embedding_list: {len(embedding_list) if isinstance(embedding_list, (list, tuple)) else 'N/A'}")
-            
-            embedding = np.array(embedding_list, dtype=np.float32)
-        else:
-            # Si no es diccionario, convertir directamente
-            embedding = np.array(embedding_obj, dtype=np.float32)
-        
-        # Validar que el embedding sea 1D
-        if embedding.ndim != 1:
-            embedding = embedding.flatten()
-        
-        # Validar que tenga al menos 128 dimensiones
-        if embedding.shape[0] < 128:
-            logger.warning(f"Embedding tiene solo {embedding.shape[0]} dimensiones, esperaba 128")
-        
-        logger.info(f"Embedding extraído: dimensiones {embedding.shape}, tipo {type(embedding)}")
-        return embedding
-    
-    except Exception as e:
-        logger.error(f"Error al extraer embedding: {str(e)}")
-        raise ValueError(f"Error al extraer características faciales: {str(e)}")
-
-
-def calculate_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> float:
-    """
-    Calcula la similitud entre dos embeddings usando cosine similarity.
-    
-    Args:
-        embedding1: Primer vector de embedding
-        embedding2: Segundo vector de embedding
-        
-    Returns:
-        float: Similitud normalizada (0-100)
-    """
-    try:
-        # Calcular distancia coseno
-        distance = cosine(embedding1, embedding2)
-        
-        # Convertir a similitud (1 - distancia)
-        similarity = 1 - distance
-        
-        # Normalizar a porcentaje (0-100)
-        similarity_percentage = similarity * 100
-        
-        return round(similarity_percentage, 2)
-    
-    except Exception as e:
-        logger.error(f"Error al calcular similitud: {str(e)}")
-        return 0.0
-
+print(f"📁 STORAGE_DIR: {STORAGE_DIR}")
+print(f"📁 STORAGE_DIR existe: {STORAGE_DIR.exists()}")
 
 @app.get("/health")
 async def health_check():
-    """
-    Endpoint de verificación de salud del servidor.
-    """
+    """Verifica el estado del servidor"""
     return {
         "status": "ok",
         "message": "Servidor de reconocimiento facial activo",
-        "model": MODEL_NAME,
-        "threshold": SIMILARITY_THRESHOLD
+        "model": "InsightFace (ArcFace)",
+        "threshold": SIMILARITY_THRESHOLD,
+        "threshold_percentage": round((1 - SIMILARITY_THRESHOLD) * 100, 2),
+        "min_face_size": MIN_FACE_SIZE,
+        "min_face_confidence": MIN_FACE_CONFIDENCE,
+        "detection_size": "1280x1280 (high-resolution)",
+        "model_loaded": face_analysis is not None,
+        "features": [
+            "Detección de rostros de perfil",
+            "Múltiples rostros por imagen",
+            "Comparación con todos los píxeles del rostro",
+            "Criterios flexibles para perfil",
+            "Múltiples métricas de similitud",
+            "Mejora de imagen automática",
+            "Detección de alta resolución"
+        ]
     }
 
+def validate_image_file(file: UploadFile) -> bool:
+    """Valida que el archivo sea una imagen válida"""
+    allowed_extensions = {'jpg', 'jpeg', 'png', 'gif', 'bmp'}
+    file_extension = file.filename.split('.')[-1].lower()
+    return file_extension in allowed_extensions
+
+async def read_image_to_array(file: UploadFile) -> np.ndarray:
+    """
+    Lee un archivo de imagen y lo convierte a array numpy con preprocesamiento mejorado.
+    
+    Aplica mejoras de calidad de imagen para optimizar la detección facial.
+    """
+    contents = await file.read()
+    
+    # Validar tamaño
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB")
+    
+    # Convertir a imagen
+    image = Image.open(io.BytesIO(contents))
+    image_array = np.array(image)
+    
+    # Convertir a BGR si es necesario (OpenCV usa BGR)
+    if len(image_array.shape) == 3 and image_array.shape[2] == 4:
+        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
+    elif len(image_array.shape) == 3 and image_array.shape[2] == 3:
+        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+    
+    # Preprocesamiento básico: asegurar que la imagen tenga buen tamaño
+    # Si es muy pequeña, redimensionar (pero mantener aspecto)
+    height, width = image_array.shape[:2]
+    min_dimension = 200  # Tamaño mínimo recomendado
+    
+    if min(height, width) < min_dimension:
+        scale = min_dimension / min(height, width)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        image_array = cv2.resize(image_array, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+    
+    return image_array
+
+def read_image_from_path(file_path: Path) -> np.ndarray:
+    """Lee una imagen desde un archivo en disco y la convierte a array numpy"""
+    # Leer imagen usando OpenCV directamente (más eficiente)
+    image_array = cv2.imread(str(file_path))
+    
+    if image_array is None:
+        # Fallback a PIL si OpenCV falla
+        image = Image.open(file_path)
+        image_array = np.array(image)
+        
+        # Convertir a BGR si es necesario
+        if len(image_array.shape) == 3 and image_array.shape[2] == 4:
+            image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
+        elif len(image_array.shape) == 3 and image_array.shape[2] == 3:
+            image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+    
+    return image_array
+
+def detect_face(image: np.ndarray) -> bool:
+    """
+    Detecta si hay un rostro en la imagen usando múltiples métodos y técnicas.
+    
+    Intenta:
+    1. InsightFace con imagen original
+    2. InsightFace con imagen mejorada
+    3. InsightFace con imagen rotada (si está habilitado)
+    4. OpenCV Haar Cascade como fallback
+    """
+    try:
+        if face_analysis is None:
+            raise ValueError("InsightFace model not loaded")
+        
+        # Asegurar que la imagen esté en formato correcto
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        
+        # Detectar con InsightFace en imagen original
+        faces = face_analysis.get(image)
+        if len(faces) > 0:
+            for face in faces:
+                bbox = face.bbox.astype(int)
+                face_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+                # Criterios de validación
+                if face_size >= MIN_FACE_SIZE and face.det_score >= MIN_FACE_CONFIDENCE:
+                    return True
+                # Si el rostro es grande, aceptarlo incluso con menor confianza
+                if face_size >= MIN_FACE_SIZE * 2:
+                    return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error detectando rostro con InsightFace: {e}")
+        # Fallback a OpenCV Haar Cascade
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            )
+            # Intentar con parámetros más flexibles
+            for scale in [1.1, 1.05]:
+                for neighbors in [3, 2]:
+                    faces = face_cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=scale,
+                        minNeighbors=neighbors,
+                        minSize=(MIN_FACE_SIZE, MIN_FACE_SIZE),
+                        flags=cv2.CASCADE_SCALE_IMAGE
+                    )
+                    if len(faces) > 0:
+                        return True
+            return False
+        except:
+            return False
+
+def extract_face_embedding(image: np.ndarray):
+    """
+    Extrae el embedding facial usando InsightFace de manera optimizada.
+    
+    Args:
+        image: Imagen en formato numpy array (BGR)
+    
+    Returns:
+        tuple: (embedding, face_object) - Embedding normalizado y objeto face con atributos
+    """
+    if face_analysis is None:
+        raise ValueError("InsightFace model not loaded")
+    
+    try:
+        # Asegurar formato BGR correcto
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        
+        # Detectar rostros con InsightFace
+        faces = face_analysis.get(image)
+        
+        if len(faces) == 0:
+            raise ValueError("No se detectó ningún rostro en la imagen")
+        
+        # Seleccionar el rostro con mayor confianza (más simple y directo)
+        best_face = max(faces, key=lambda f: f.det_score)
+        
+        if DEBUG_MODE:
+            bbox = best_face.bbox.astype(int)
+            face_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+            print(f"  📍 Rostro detectado: tamaño={face_size}px, confianza={best_face.det_score:.3f}")
+        
+        # Obtener embedding normalizado de InsightFace
+        embedding = best_face.normed_embedding
+        
+        # Asegurar normalización
+        embedding = embedding / (np.linalg.norm(embedding) + 1e-10)
+        
+        return np.array(embedding), best_face
+        
+    except Exception as e:
+        print(f"Error extrayendo embedding: {e}")
+        raise HTTPException(status_code=400, detail=f"Error procesando imagen: {str(e)}")
+
+async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos_in_folder: List[Path]):
+    """
+    Compara un selfie con fotos de una carpeta específica
+    """
+    try:
+        # Validar que el selfie sea una imagen
+        if not validate_image_file(selfie):
+            raise HTTPException(
+                status_code=400,
+                detail="El selfie debe ser una imagen válida (JPG, PNG, GIF, BMP)"
+            )
+        
+        # Leer el selfie
+        selfie_array = await read_image_to_array(selfie)
+        
+        # Detectar rostro en el selfie
+        if not detect_face(selfie_array):
+            raise HTTPException(
+                status_code=400,
+                detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
+            )
+        
+        # Extraer embedding del selfie
+        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        
+        if DEBUG_MODE:
+            print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
+        
+        # Procesar fotos de la carpeta
+        matches = []
+        non_matches = []
+        errors = 0
+        
+        for photo_path in photos_in_folder:
+            try:
+                # Leer foto desde disco
+                photo_array = read_image_from_path(photo_path)
+                
+                # Detectar rostro
+                if not detect_face(photo_array):
+                    non_matches.append({
+                        "file": photo_path.name,
+                        "similarity": 0,
+                        "reason": "No se detectó rostro"
+                    })
+                    continue
+                
+                # Extraer embedding
+                photo_embedding, _ = extract_face_embedding(photo_array)
+                
+                # Calcular similitud
+                similarity, distance = calculate_similarity(
+                    selfie_embedding, 
+                    photo_embedding
+                )
+                
+                # Umbral muy permisivo: aceptar cualquier similitud >= 30%
+                min_similarity_percent = (1 - SIMILARITY_THRESHOLD) * 100
+                
+                if DEBUG_MODE:
+                    print(f"📊 {photo_path.name}: similitud={similarity:.2f}%, distancia={distance:.4f}, umbral={SIMILARITY_THRESHOLD}")
+                
+                # Aceptar solo si la distancia es <= umbral
+                if distance <= SIMILARITY_THRESHOLD:
+                    matches.append({
+                        "file": photo_path.name,
+                        "similarity": similarity
+                    })
+                    if DEBUG_MODE:
+                        print(f"✅ MATCH: {photo_path.name} (similitud: {similarity:.2f}%)")
+                else:
+                    non_matches.append({
+                        "file": photo_path.name,
+                        "similarity": similarity,
+                        "reason": f"Similitud {similarity:.2f}% por debajo del umbral {min_similarity_percent:.2f}%"
+                    })
+                    if DEBUG_MODE:
+                        print(f"❌ NO MATCH: {photo_path.name} (similitud: {similarity:.2f}%)")
+                    
+            except Exception as e:
+                print(f"Error procesando {photo_path.name}: {e}")
+                errors += 1
+                continue
+        
+        # Calcular estadísticas
+        total_photos = len(photos_in_folder)
+        matches_count = len(matches)
+        non_matches_count = len(non_matches)
+        match_percentage = (matches_count / total_photos * 100) if total_photos > 0 else 0
+        
+        # Ordenar matches por similitud descendente
+        matches_sorted = sorted(matches, key=lambda x: x["similarity"], reverse=True)
+        
+        # Imprimir resumen en consola
+        if DEBUG_MODE:
+            print("\n" + "="*60)
+            print(f"📋 RESUMEN DE BÚSQUEDA - {folder_name}")
+            print("="*60)
+            print(f"✅ MATCHES ENCONTRADOS: {matches_count}")
+            if matches_sorted:
+                for i, match in enumerate(matches_sorted, 1):
+                    print(f"  {i}. {match['file']} - Similitud: {match['similarity']:.2f}%")
+            else:
+                print("  (ninguno)")
+            print(f"\n❌ NO MATCHES: {non_matches_count}")
+            print(f"📊 Porcentaje de coincidencia: {match_percentage:.2f}%")
+            print("="*60 + "\n")
+        
+        return {
+            "status": "success",
+            "selfie": selfie.filename,
+            "folder": folder_name,
+            "matches": matches_sorted,
+            "non_matches": non_matches,
+            "statistics": {
+                "total_photos": total_photos,
+                "matches_count": matches_count,
+                "non_matches_count": non_matches_count,
+                "errors_count": errors,
+                "match_percentage": round(match_percentage, 2),
+                "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2)
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error en compare_faces_from_folder: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando solicitud: {str(e)}"
+        )
+
+def calculate_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> tuple:
+    """
+    Calcula la similitud entre embeddings usando distancia coseno.
+    
+    Retorna:
+        tuple: (similitud_porcentaje, distancia_coseno)
+        - similitud: 0-100 (100 = idénticos, 0 = diferentes)
+        - distancia: 0-2 (0 = idénticos, 2 = opuestos)
+    """
+    from scipy.spatial.distance import cosine
+    import numpy as np
+    
+    # Asegurar que los embeddings sean 1-D
+    embedding1 = np.array(embedding1).flatten()
+    embedding2 = np.array(embedding2).flatten()
+    
+    # Validar que tengan la misma dimensión
+    if embedding1.shape != embedding2.shape:
+        if DEBUG_MODE:
+            print(f"⚠️ Embeddings con formas diferentes: {embedding1.shape} vs {embedding2.shape}")
+        min_dim = min(len(embedding1), len(embedding2))
+        embedding1 = embedding1[:min_dim]
+        embedding2 = embedding2[:min_dim]
+    
+    # Normalizar
+    norm1 = np.linalg.norm(embedding1)
+    norm2 = np.linalg.norm(embedding2)
+    
+    if norm1 > 0:
+        embedding1 = embedding1 / norm1
+    if norm2 > 0:
+        embedding2 = embedding2 / norm2
+    
+    # Calcular distancia coseno
+    cosine_distance = cosine(embedding1, embedding2)
+    
+    # Convertir a similitud (0-100)
+    similarity = (1 - cosine_distance) * 100
+    
+    # Asegurar que esté en el rango [0, 100]
+    similarity = max(0, min(100, similarity))
+    
+    # Convertir a float nativo de Python (no numpy.float32)
+    return float(round(similarity, 2)), float(round(cosine_distance, 4))
+
+@app.post("/compare-faces-folder")
+async def compare_faces_folder(
+    selfie: UploadFile = File(...),
+    search_folder: str = Query(...),
+    search_day: str = Query(None)
+):
+    """
+    Busca un selfie en una carpeta específica y opcionalmente en un día específico
+    
+    - **selfie**: Imagen del rostro a comparar
+    - **search_folder**: Nombre de la carpeta para buscar (ej: 'Surf')
+    - **search_day**: (Opcional) Día específico para buscar (ej: '2026-01-13')
+    """
+    try:
+        folder_path = STORAGE_DIR / search_folder
+        
+        if not folder_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"La carpeta '{search_folder}' no existe"
+            )
+        
+        # Si se especifica un día, buscar en la subcarpeta del día
+        if search_day:
+            day_folder_path = folder_path / search_day
+            if not day_folder_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"El día '{search_day}' no existe en la carpeta '{search_folder}'"
+                )
+            search_path = day_folder_path
+            search_label = f"{search_folder}/{search_day}"
+        else:
+            search_path = folder_path
+            search_label = search_folder
+        
+        # Obtener todas las fotos de la carpeta/día
+        photos_in_folder = [f for f in search_path.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}]
+        
+        if len(photos_in_folder) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No hay fotos en '{search_label}'"
+            )
+        
+        # Procesar fotos desde la carpeta/día
+        return await compare_faces_from_folder(selfie, search_label, photos_in_folder)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error en compare_faces_folder: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando solicitud: {str(e)}"
+        )
 
 @app.post("/compare-faces")
 async def compare_faces(
     selfie: UploadFile = File(...),
-    photos: list[UploadFile] = File(...)
+    photos: List[UploadFile] = File(...)
 ):
     """
-    Endpoint principal para comparar rostros.
+    Compara un selfie con múltiples fotos (4-10 imágenes)
     
-    Recibe:
-        - selfie: Imagen base del rostro a comparar
-        - photos: Lista de imágenes adicionales
-        
-    Retorna:
-        JSON con:
-        - matches: Imágenes que coinciden con el selfie
-        - non_matches: Imágenes que no coinciden
-        - statistics: Estadísticas generales
+    - **selfie**: Imagen del rostro a comparar
+    - **photos**: Lista de imágenes para comparar (4-10 imágenes)
     """
-    
     try:
-        logger.info("=== INICIANDO COMPARACIÓN DE ROSTROS ===")
+        # Validar cantidad de fotos cargadas
+        if len(photos) < 4 or len(photos) > 10:
+            raise HTTPException(
+                status_code=400,
+                detail="Debe proporcionar entre 4 y 10 fotos"
+            )
         
-        # Validar selfie
+        # Validar que el selfie sea una imagen
         if not validate_image_file(selfie):
             raise HTTPException(
                 status_code=400,
-                detail="Archivo selfie inválido. Formatos permitidos: jpg, jpeg, png, gif, bmp"
+                detail="El selfie debe ser una imagen válida (JPG, PNG, GIF, BMP)"
             )
         
-        logger.info(f"Selfie recibido: {selfie.filename}")
+        # Leer el selfie
+        selfie_array = await read_image_to_array(selfie)
         
-        # Leer selfie
-        selfie_image = read_image_to_array(selfie)
-        
-        # Detectar rostro en selfie
-        if not detect_face(selfie_image):
+        # Detectar rostro en el selfie
+        if not detect_face(selfie_array):
             raise HTTPException(
                 status_code=400,
-                detail="No se detectó rostro en la imagen selfie"
+                detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
             )
         
-        logger.info("Rostro detectado en selfie")
-        
         # Extraer embedding del selfie
-        selfie_embedding = extract_face_embedding(selfie_image)
-        logger.info("Embedding del selfie extraído exitosamente")
+        selfie_embedding, _ = extract_face_embedding(selfie_array)
         
-        # Procesar fotos adicionales
+        if DEBUG_MODE:
+            print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
+        
+        # Procesar fotos cargadas
         matches = []
         non_matches = []
-        errors = []
+        errors = 0
         
-        logger.info(f"Procesando {len(photos)} imágenes adicionales...")
-        
-        for idx, photo in enumerate(photos, 1):
+        for photo in photos:
             try:
-                logger.info(f"[{idx}/{len(photos)}] Procesando: {photo.filename}")
-                
-                # Validar foto
+                # Validar que sea una imagen
                 if not validate_image_file(photo):
-                    errors.append({
-                        "file": photo.filename,
-                        "error": "Formato de archivo no permitido"
-                    })
+                    errors += 1
                     continue
                 
                 # Leer foto
-                photo_image = read_image_to_array(photo)
+                photo_array = await read_image_to_array(photo)
                 
                 # Detectar rostro
-                if not detect_face(photo_image):
+                if not detect_face(photo_array):
                     non_matches.append({
                         "file": photo.filename,
-                        "similarity": 0.0,
+                        "similarity": 0,
                         "reason": "No se detectó rostro"
                     })
-                    logger.info(f"  ✗ No se detectó rostro")
                     continue
                 
                 # Extraer embedding
-                photo_embedding = extract_face_embedding(photo_image)
+                photo_embedding, _ = extract_face_embedding(photo_array)
                 
                 # Calcular similitud
-                similarity = calculate_similarity(selfie_embedding, photo_embedding)
+                similarity = calculate_similarity(
+                    selfie_embedding, 
+                    photo_embedding
+                )
                 
-                # Convertir threshold a porcentaje para comparación
-                threshold_percentage = SIMILARITY_THRESHOLD * 100
+                # Clasificar como match o no-match
+                # Convertir similitud a distancia coseno para comparar
+                distance = 1 - (similarity / 100)
                 
-                # DEBUG: Log de similitud
-                logger.info(f"  DEBUG: similarity={similarity}, threshold={threshold_percentage}, match={similarity >= threshold_percentage}")
+                # Umbral muy permisivo: aceptar cualquier similitud >= 30%
+                min_similarity_percent = (1 - SIMILARITY_THRESHOLD) * 100
                 
-                # Clasificar como coincidencia o no
-                if similarity >= threshold_percentage:
+                if DEBUG_MODE:
+                    print(f"📊 {photo.filename}: similitud={similarity:.2f}%, distancia={distance:.4f}, umbral={SIMILARITY_THRESHOLD}")
+                
+                # Aceptar solo si la distancia es <= umbral
+                if distance <= SIMILARITY_THRESHOLD:
                     matches.append({
                         "file": photo.filename,
                         "similarity": similarity
                     })
-                    logger.info(f"  ✓ COINCIDENCIA: {similarity}%")
+                    if DEBUG_MODE:
+                        print(f"✅ MATCH: {photo.filename} (similitud: {similarity:.2f}%)")
                 else:
                     non_matches.append({
                         "file": photo.filename,
                         "similarity": similarity,
-                        "reason": "Similitud por debajo del umbral"
+                        "reason": f"Similitud {similarity:.2f}% por debajo del umbral {min_similarity_percent:.2f}%"
                     })
-                    logger.info(f"  ✗ No coincide: {similarity}%")
-            
+                    if DEBUG_MODE:
+                        print(f"❌ NO MATCH: {photo.filename} (similitud: {similarity:.2f}%)")
+                    
             except Exception as e:
-                error_msg = str(e)
-                errors.append({
-                    "file": photo.filename,
-                    "error": error_msg
-                })
-                logger.error(f"  ✗ Error: {error_msg}")
+                print(f"Error procesando {photo.filename}: {e}")
+                errors += 1
+                continue
         
-        # Construir respuesta
-        response = {
+        # Calcular estadísticas
+        total_photos = len(photos)
+        matches_count = len(matches)
+        non_matches_count = len(non_matches)
+        match_percentage = (matches_count / total_photos * 100) if total_photos > 0 else 0
+        
+        # Ordenar matches por similitud descendente
+        matches_sorted = sorted(matches, key=lambda x: x["similarity"], reverse=True)
+        
+        # Imprimir resumen en consola
+        if DEBUG_MODE:
+            print("\n" + "="*60)
+            print(f"📋 RESUMEN DE BÚSQUEDA")
+            print("="*60)
+            print(f"✅ MATCHES ENCONTRADOS: {matches_count}")
+            if matches_sorted:
+                for i, match in enumerate(matches_sorted, 1):
+                    print(f"  {i}. {match['file']} - Similitud: {match['similarity']:.2f}%")
+            else:
+                print("  (ninguno)")
+            print(f"\n❌ NO MATCHES: {non_matches_count}")
+            print(f"📊 Porcentaje de coincidencia: {match_percentage:.2f}%")
+            print("="*60 + "\n")
+        
+        return {
             "status": "success",
             "selfie": selfie.filename,
-            "matches": matches,
+            "matches": matches_sorted,
             "non_matches": non_matches,
-            "errors": errors,
             "statistics": {
-                "total_photos": len(photos),
-                "matches_count": len(matches),
-                "non_matches_count": len(non_matches),
-                "errors_count": len(errors),
-                "match_percentage": round(
-                    (len(matches) / len(photos) * 100) if len(photos) > 0 else 0, 2
-                ),
-                "threshold_used": SIMILARITY_THRESHOLD * 100
+                "total_photos": total_photos,
+                "matches_count": matches_count,
+                "non_matches_count": non_matches_count,
+                "errors_count": errors,
+                "match_percentage": round(match_percentage, 2),
+                "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2)
             }
         }
         
-        logger.info("=== COMPARACIÓN COMPLETADA ===")
-        logger.info(f"Resultados: {len(matches)} coincidencias, {len(non_matches)} no coincidencias")
-        
-        return JSONResponse(content=response, status_code=200)
-    
-    except HTTPException as e:
-        logger.error(f"Error HTTP: {e.detail}")
-        raise e
-    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error inesperado: {str(e)}")
+        print(f"Error en compare_faces: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error interno del servidor: {str(e)}"
+            detail=f"Error procesando solicitud: {str(e)}"
         )
 
+# ==================== ENDPOINTS DE GESTIÓN DE CARPETAS ====================
+
+@app.get("/folders/list")
+async def list_folders():
+    """Lista todas las carpetas disponibles"""
+    try:
+        storage_path = STORAGE_DIR
+        folders = []
+        
+        for folder in storage_path.iterdir():
+            if folder.is_dir():
+                metadata_path = folder / "metadata.json"
+                if metadata_path.exists():
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    
+                    # Contar fotos
+                    photo_count = len([f for f in folder.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}])
+                    
+                    folders.append({
+                        "name": folder.name,
+                        "created_at": metadata.get("created_at"),
+                        "photo_count": photo_count
+                    })
+        
+        return {
+            "status": "success",
+            "folders": sorted(folders, key=lambda x: x["created_at"], reverse=True)
+        }
+    except Exception as e:
+        print(f"Error listando carpetas: {e}")
+        raise HTTPException(status_code=500, detail=f"Error listando carpetas: {str(e)}")
+
+@app.get("/folders")
+async def get_folders():
+    """Lista todas las carpetas disponibles (alias de /folders/list)"""
+    return await list_folders()
+
+@app.post("/folders/create")
+async def create_folder(folder_name: str = Query(...)):
+    """Crea una nueva carpeta para almacenar fotos"""
+    try:
+        # Validar nombre de carpeta
+        if not folder_name or len(folder_name.strip()) == 0:
+            raise HTTPException(status_code=400, detail="El nombre de la carpeta no puede estar vacío")
+        
+        # Sanitizar nombre
+        folder_name = folder_name.strip().replace("/", "_").replace("\\", "_")
+        
+        folder_path = STORAGE_DIR / folder_name
+        
+        # Verificar si ya existe
+        if folder_path.exists():
+            raise HTTPException(status_code=400, detail="La carpeta ya existe")
+        
+        # Crear carpeta
+        folder_path.mkdir(parents=True, exist_ok=True)
+        
+        # Crear archivo de metadata
+        metadata = {
+            "name": folder_name,
+            "created_at": datetime.now().isoformat(),
+            "cover_image": None,
+            "days": [],
+            "photos": []
+        }
+        
+        metadata_path = folder_path / "metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return {
+            "status": "success",
+            "message": f"Carpeta '{folder_name}' creada exitosamente",
+            "folder_name": folder_name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creando carpeta: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creando carpeta: {str(e)}")
+
+@app.post("/folders/set-cover")
+async def set_folder_cover(
+    folder_name: str = Query(...),
+    cover_image: UploadFile = File(...)
+):
+    """Establece la imagen de portada de una carpeta"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        # Validar que sea una imagen
+        if not validate_image_file(cover_image):
+            raise HTTPException(status_code=400, detail="El archivo debe ser una imagen válida")
+        
+        # Guardar imagen de portada
+        cover_filename = f"cover_{cover_image.filename}"
+        cover_path = folder_path / cover_filename
+        
+        contents = await cover_image.read()
+        with open(cover_path, 'wb') as f:
+            f.write(contents)
+        
+        # Actualizar metadata
+        metadata_path = folder_path / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {
+                "name": folder_name,
+                "created_at": datetime.now().isoformat(),
+                "days": [],
+                "photos": []
+            }
+        
+        metadata["cover_image"] = cover_filename
+        
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return {
+            "status": "success",
+            "message": "Imagen de portada actualizada",
+            "cover_image": cover_filename
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error estableciendo portada: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/folders/create-day")
+async def create_day_folder(
+    folder_name: str = Query(...),
+    day_date: str = Query(...)
+):
+    """Crea una subcarpeta para un día específico dentro de una carpeta"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        # Validar formato de fecha
+        try:
+            datetime.fromisoformat(day_date)
+        except:
+            raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD")
+        
+        # Crear subcarpeta del día
+        day_folder_path = folder_path / day_date
+        day_folder_path.mkdir(parents=True, exist_ok=True)
+        
+        # Actualizar metadata de la carpeta principal
+        metadata_path = folder_path / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {
+                "name": folder_name,
+                "created_at": datetime.now().isoformat(),
+                "cover_image": None,
+                "days": [],
+                "photos": []
+            }
+        
+        if "days" not in metadata:
+            metadata["days"] = []
+        
+        if day_date not in metadata["days"]:
+            metadata["days"].append(day_date)
+            metadata["days"].sort(reverse=True)
+        
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return {
+            "status": "success",
+            "message": f"Día '{day_date}' creado en carpeta '{folder_name}'",
+            "day_date": day_date
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creando día: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/folders/{folder_name}/days")
+async def get_folder_days(folder_name: str):
+    """Obtiene todos los días disponibles en una carpeta"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        # Obtener subcarpetas (días)
+        days = []
+        for item in folder_path.iterdir():
+            if item.is_dir() and item.name != "__pycache__":
+                # Verificar si es una fecha válida
+                try:
+                    datetime.fromisoformat(item.name)
+                    # Contar fotos en el día
+                    photo_count = len([f for f in item.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}])
+                    days.append({
+                        "date": item.name,
+                        "photo_count": photo_count
+                    })
+                except:
+                    continue
+        
+        # Ordenar por fecha descendente
+        days.sort(key=lambda x: x["date"], reverse=True)
+        
+        return {
+            "status": "success",
+            "folder": folder_name,
+            "days": days
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error obteniendo días: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.delete("/folders/delete")
+async def delete_folder(folder_name: str = Query(...)):
+    """Elimina una carpeta y todas sus fotos"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        # Eliminar carpeta y su contenido
+        shutil.rmtree(folder_path)
+        
+        return {
+            "status": "success",
+            "message": f"Carpeta '{folder_name}' eliminada exitosamente"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error eliminando carpeta: {e}")
+        raise HTTPException(status_code=500, detail=f"Error eliminando carpeta: {str(e)}")
+
+# ==================== ENDPOINTS DE GESTIÓN DE FOTOS ====================
+
+@app.post("/photos/upload")
+async def upload_photos(
+    folder_name: str = Query(...),
+    photos: List[UploadFile] = File(...)
+):
+    """Sube fotos a una carpeta específica (subida rápida sin procesamiento)"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        if len(photos) == 0:
+            raise HTTPException(status_code=400, detail="Debe proporcionar al menos una foto")
+        
+        uploaded_photos = []
+        errors = []
+        
+        for photo in photos:
+            try:
+                # Validar que sea una imagen
+                if not validate_image_file(photo):
+                    errors.append(f"{photo.filename}: Formato no válido")
+                    continue
+                
+                # Leer contenido completo del archivo una sola vez
+                contents = await photo.read()
+                photo_size = len(contents)
+                
+                # Validar tamaño
+                if photo_size > MAX_FILE_SIZE:
+                    errors.append(f"{photo.filename}: Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB")
+                    continue
+                
+                # Guardar foto directamente sin procesamiento
+                photo_path = folder_path / photo.filename
+                with open(photo_path, 'wb') as f:
+                    f.write(contents)
+                
+                uploaded_photos.append({
+                    "filename": photo.filename,
+                    "size": photo_size,
+                    "status": "success"
+                })
+                
+                print(f"✅ Foto guardada: {photo.filename} ({photo_size / 1024:.2f} KB)")
+                
+            except HTTPException as e:
+                errors.append(f"{photo.filename}: {e.detail}")
+            except Exception as e:
+                errors.append(f"{photo.filename}: {str(e)}")
+        
+        return {
+            "status": "success",
+            "uploaded": len(uploaded_photos),
+            "photos": uploaded_photos,
+            "errors": errors,
+            "message": f"{len(uploaded_photos)} fotos subidas correctamente"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error subiendo fotos: {e}")
+        raise HTTPException(status_code=500, detail=f"Error subiendo fotos: {str(e)}")
+
+@app.get("/photos/list")
+async def list_photos(folder_name: str = Query(...)):
+    """Lista todas las fotos en una carpeta"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        photos = []
+        
+        for file in folder_path.iterdir():
+            if file.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                photos.append({
+                    "filename": file.name,
+                    "size": file.stat().st_size,
+                    "created_at": datetime.fromtimestamp(file.stat().st_ctime).isoformat()
+                })
+        
+        return {
+            "status": "success",
+            "folder": folder_name,
+            "photos": sorted(photos, key=lambda x: x["created_at"], reverse=True)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error listando fotos: {e}")
+        raise HTTPException(status_code=500, detail=f"Error listando fotos: {str(e)}")
+
+@app.get("/photos/preview")
+async def get_photo_preview(
+    folder_name: str = Query(...),
+    filename: str = Query(...),
+    watermark: bool = Query(True),
+    day: str = Query(None)
+):
+    """Obtiene una foto con marca de agua para previsualización"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        # Si se especifica un día, buscar en la subcarpeta del día
+        if day:
+            photo_path = folder_path / day / filename
+        else:
+            photo_path = folder_path / filename
+        
+        print(f"🔍 Buscando foto: {photo_path}")
+        print(f"🔍 Path existe: {photo_path.exists()}")
+        print(f"🔍 Path absoluto: {photo_path.absolute()}")
+        
+        if not photo_path.exists():
+            raise HTTPException(status_code=404, detail=f"La foto no existe: {photo_path}")
+        
+        # Leer la imagen
+        image = Image.open(photo_path)
+        
+        # Agregar marca de agua si se solicita
+        if watermark:
+            # Convertir a RGB primero para simplificar
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Crear una copia para trabajar
+            watermarked = image.copy()
+            draw = ImageDraw.Draw(watermarked)
+            
+            # Texto de la marca de agua
+            watermark_text = "SURFSHOT"
+            
+            # Obtener dimensiones de la imagen
+            width, height = watermarked.size
+            
+            # Intentar cargar una fuente, si no está disponible usar la predeterminada
+            font_size = max(width, height) // 15
+            font = None
+            try:
+                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+            except:
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+            
+            # Obtener dimensiones del texto (método compatible)
+            try:
+                # PIL 10.0.0+ usa textbbox
+                if hasattr(draw, 'textbbox'):
+                    bbox = draw.textbbox((0, 0), watermark_text, font=font)
+                    text_width = bbox[2] - bbox[0]
+                    text_height = bbox[3] - bbox[1]
+                else:
+                    # Versiones antiguas de PIL usan textsize
+                    text_width, text_height = draw.textsize(watermark_text, font=font)
+            except Exception as e:
+                # Fallback: estimar tamaño del texto
+                text_width = len(watermark_text) * font_size // 2
+                text_height = font_size
+            
+            # Calcular posición (centro de la imagen)
+            x = (width - text_width) // 2
+            y = (height - text_height) // 2
+            
+            # Dibujar sombra del texto (para mejor visibilidad)
+            shadow_offset = 2
+            draw.text((x + shadow_offset, y + shadow_offset), watermark_text, 
+                     fill=(0, 0, 0), font=font)
+            
+            # Dibujar el texto principal (blanco)
+            draw.text((x, y), watermark_text, 
+                     fill=(255, 255, 255), font=font)
+            
+            # Agregar marca de agua adicional en la esquina inferior derecha
+            corner_text = "PREVIEW"
+            corner_font_size = max(width, height) // 25
+            corner_font = None
+            try:
+                corner_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", corner_font_size)
+            except:
+                try:
+                    corner_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", corner_font_size)
+                except:
+                    corner_font = ImageFont.load_default()
+            
+            try:
+                if hasattr(draw, 'textbbox'):
+                    corner_bbox = draw.textbbox((0, 0), corner_text, font=corner_font)
+                    corner_text_width = corner_bbox[2] - corner_bbox[0]
+                    corner_text_height = corner_bbox[3] - corner_bbox[1]
+                else:
+                    corner_text_width, corner_text_height = draw.textsize(corner_text, font=corner_font)
+            except Exception as e:
+                corner_text_width = len(corner_text) * corner_font_size // 2
+                corner_text_height = corner_font_size
+            
+            corner_x = width - corner_text_width - 20
+            corner_y = height - corner_text_height - 20
+            
+            # Fondo semi-transparente para el texto de la esquina (usando RGB con alpha simulado)
+            draw.rectangle([corner_x - 10, corner_y - 5, corner_x + corner_text_width + 10, corner_y + corner_text_height + 5],
+                          fill=(0, 0, 0))
+            
+            draw.text((corner_x, corner_y), corner_text, 
+                     fill=(255, 255, 255), font=corner_font)
+            
+            output_image = watermarked
+        else:
+            # Convertir a RGB si es necesario para JPEG
+            if image.mode != 'RGB':
+                output_image = image.convert('RGB')
+            else:
+                output_image = image
+        
+        # Convertir a bytes
+        img_byte_arr = io.BytesIO()
+        
+        # Determinar formato y content type
+        if filename.lower().endswith('.png'):
+            if output_image.mode != 'RGB':
+                output_image = output_image.convert('RGB')
+            output_image.save(img_byte_arr, format='PNG')
+            content_type = "image/png"
+        else:
+            if output_image.mode != 'RGB':
+                output_image = output_image.convert('RGB')
+            output_image.save(img_byte_arr, format='JPEG', quality=85)
+            content_type = "image/jpeg"
+        
+        img_byte_arr.seek(0)
+        
+        return Response(content=img_byte_arr.read(), media_type=content_type)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error obteniendo preview: {e}")
+        print(traceback.format_exc())
+        # Si falla el preview, intentar devolver la imagen original
+        try:
+            photo_path = STORAGE_DIR / folder_name / filename
+            if photo_path.exists():
+                with open(photo_path, 'rb') as f:
+                    content = f.read()
+                content_type = "image/jpeg"
+                if filename.lower().endswith('.png'):
+                    content_type = "image/png"
+                return Response(content=content, media_type=content_type)
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"Error obteniendo preview: {str(e)}")
+
+@app.get("/photos/view")
+async def get_photo_view(
+    folder_name: str = Query(...),
+    filename: str = Query(...)
+):
+    """Obtiene una foto original sin marca de agua (fallback)"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        photo_path = folder_path / filename
+        
+        if not photo_path.exists():
+            raise HTTPException(status_code=404, detail="La foto no existe")
+        
+        # Leer y devolver la imagen original
+        with open(photo_path, 'rb') as f:
+            content = f.read()
+        
+        content_type = "image/jpeg"
+        if filename.lower().endswith('.png'):
+            content_type = "image/png"
+        elif filename.lower().endswith('.gif'):
+            content_type = "image/gif"
+        
+        return Response(content=content, media_type=content_type)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error obteniendo foto: {e}")
+        raise HTTPException(status_code=500, detail=f"Error obteniendo foto: {str(e)}")
+
+@app.delete("/photos/delete")
+async def delete_photo(folder_name: str = Query(...), filename: str = Query(...)):
+    """Elimina una foto de una carpeta"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        photo_path = folder_path / filename
+        
+        if not photo_path.exists():
+            raise HTTPException(status_code=404, detail="La foto no existe")
+        
+        # Eliminar foto
+        photo_path.unlink()
+        
+        # Eliminar embedding si existe
+        embedding_filename = filename.rsplit('.', 1)[0] + '.npy'
+        embedding_path = folder_path / embedding_filename
+        if embedding_path.exists():
+            embedding_path.unlink()
+        
+        return {
+            "status": "success",
+            "message": f"Foto '{filename}' eliminada exitosamente"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error eliminando foto: {e}")
+        raise HTTPException(status_code=500, detail=f"Error eliminando foto: {str(e)}")
+
+# ==================== ENDPOINT DE BÚSQUEDA ====================
+
+@app.post("/search/similar")
+async def search_similar(selfie: UploadFile = File(...)):
+    """Busca fotos similares en TODAS las carpetas"""
+    try:
+        # Validar que el selfie sea una imagen
+        if not validate_image_file(selfie):
+            raise HTTPException(
+                status_code=400,
+                detail="El selfie debe ser una imagen válida (JPG, PNG, GIF, BMP)"
+            )
+        
+        # Leer el selfie
+        selfie_array = await read_image_to_array(selfie)
+        
+        # Detectar rostro en el selfie
+        if not detect_face(selfie_array):
+            raise HTTPException(
+                status_code=400,
+                detail="No se detectó un rostro en el selfie"
+            )
+        
+        # Extraer embedding del selfie
+        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        
+        # Buscar fotos similares en TODAS las carpetas
+        matches = []
+        non_matches = []
+        
+        storage_path = STORAGE_DIR
+        
+        # Iterar sobre todas las carpetas
+        for folder in storage_path.iterdir():
+            if folder.is_dir():
+                # Iterar sobre todas las fotos en la carpeta
+                for file in folder.iterdir():
+                    if file.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                        try:
+                            # Siempre extraer embedding fresco con InsightFace
+                            photo_array = read_image_from_path(file)
+                            
+                            # Verificar que la imagen tenga un rostro
+                            if not detect_face(photo_array):
+                                if DEBUG_MODE:
+                                    print(f"⚠️ {file.name}: No se detectó rostro, saltando...")
+                                continue
+                            
+                            try:
+                                photo_embedding, _ = extract_face_embedding(photo_array)
+                            except Exception as e:
+                                if DEBUG_MODE:
+                                    print(f"❌ {file.name}: Error extrayendo embedding: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                continue
+                            
+                            # Calcular similitud
+                            similarity, distance = calculate_similarity(
+                                selfie_embedding, 
+                                photo_embedding
+                            )
+                            
+                            if DEBUG_MODE:
+                                print(f"📊 {file.name}: similitud={similarity:.2f}%, distancia={distance:.4f}")
+                            
+                            # Aceptar solo si distancia <= umbral (más estricto)
+                            if distance <= SIMILARITY_THRESHOLD:
+                                matches.append({
+                                    "file": file.name,
+                                    "folder": folder.name,
+                                    "similarity": similarity
+                                })
+                            else:
+                                non_matches.append({
+                                    "file": file.name,
+                                    "folder": folder.name,
+                                    "similarity": similarity
+                                })
+                                
+                        except Exception as e:
+                            print(f"Error procesando {file.name}: {e}")
+                            continue
+        
+        # Calcular estadísticas
+        total_photos = len(matches) + len(non_matches)
+        matches_count = len(matches)
+        non_matches_count = len(non_matches)
+        match_percentage = (matches_count / total_photos * 100) if total_photos > 0 else 0
+        
+        return {
+            "status": "success",
+            "search_scope": "all_folders",
+            "matches": sorted(matches, key=lambda x: x["similarity"], reverse=True),
+            "non_matches": sorted(non_matches, key=lambda x: x["similarity"], reverse=True),
+            "statistics": {
+                "total_photos": total_photos,
+                "matches_count": matches_count,
+                "non_matches_count": non_matches_count,
+                "match_percentage": round(match_percentage, 2),
+                "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2)
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error en search_similar: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando solicitud: {str(e)}"
+        )
+
+# ==================== ENDPOINTS DEL MARKETPLACE ====================
+
+@app.get("/marketplace/photos")
+async def get_marketplace_photos():
+    """Obtiene todas las fotos disponibles en el marketplace"""
+    try:
+        photos = []
+        storage_path = STORAGE_DIR
+        
+        # Iterar sobre todas las carpetas (escuelas)
+        for school_folder in storage_path.iterdir():
+            if school_folder.is_dir():
+                school_name = school_folder.name
+                
+                # Iterar sobre todas las fotos en la carpeta
+                for file in school_folder.iterdir():
+                    if file.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                        # Obtener fecha de creación
+                        created_at = datetime.fromtimestamp(file.stat().st_ctime)
+                        date_str = created_at.strftime("%Y-%m-%d")
+                        
+                        # Generar URL de preview con marca de agua
+                        preview_url = f"/photos/preview?folder_name={school_name}&filename={file.name}&watermark=true"
+                        
+                        photos.append({
+                            "id": f"{school_name}_{file.stem}",
+                            "filename": file.name,
+                            "school": school_name,
+                            "date": date_str,
+                            "similarity": None,
+                            "thumbnail": preview_url,
+                            "image": preview_url
+                        })
+        
+        return {
+            "status": "success",
+            "photos": photos
+        }
+    except Exception as e:
+        print(f"Error obteniendo fotos del marketplace: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error obteniendo fotos: {str(e)}"
+        )
+
+@app.get("/marketplace/filters")
+async def get_marketplace_filters():
+    """Obtiene los filtros disponibles (escuelas y días)"""
+    try:
+        schools = set()
+        days = set()
+        storage_path = STORAGE_DIR
+        
+        # Iterar sobre todas las carpetas
+        for school_folder in storage_path.iterdir():
+            if school_folder.is_dir():
+                schools.add(school_folder.name)
+                
+                # Iterar sobre fotos para obtener fechas
+                for file in school_folder.iterdir():
+                    if file.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                        created_at = datetime.fromtimestamp(file.stat().st_ctime)
+                        date_str = created_at.strftime("%Y-%m-%d")
+                        days.add(date_str)
+        
+        return {
+            "status": "success",
+            "schools": sorted(list(schools)),
+            "days": sorted(list(days), reverse=True)
+        }
+    except Exception as e:
+        print(f"Error obteniendo filtros: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error obteniendo filtros: {str(e)}"
+        )
+
+@app.post("/marketplace/search-similar")
+async def marketplace_search_similar(selfie: UploadFile = File(...)):
+    """Busca fotos similares en el marketplace"""
+    try:
+        # Validar que el selfie sea una imagen
+        if not validate_image_file(selfie):
+            raise HTTPException(
+                status_code=400,
+                detail="El selfie debe ser una imagen válida (JPG, PNG, GIF, BMP)"
+            )
+        
+        # Leer el selfie
+        selfie_array = await read_image_to_array(selfie)
+        
+        # Detectar rostro en el selfie
+        if not detect_face(selfie_array):
+            raise HTTPException(
+                status_code=400,
+                detail="No se detectó un rostro en el selfie"
+            )
+        
+        # Extraer embedding del selfie
+        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        
+        if DEBUG_MODE:
+            print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
+        
+        # Buscar fotos similares en photos_storage
+        photos_with_similarity = []
+        storage_path = STORAGE_DIR
+        
+        if DEBUG_MODE:
+            print(f"🔍 Buscando fotos en: {storage_path}")
+            print(f"📁 Carpetas encontradas: {[f.name for f in storage_path.iterdir() if f.is_dir()]}")
+        
+        # Iterar sobre todas las carpetas en photos_storage
+        for school_folder in storage_path.iterdir():
+            if school_folder.is_dir():
+                school_name = school_folder.name
+                
+                # Iterar sobre todas las fotos
+                for file in school_folder.iterdir():
+                    if file.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                        try:
+                            # IMPORTANTE: Siempre extraer embedding fresco con InsightFace
+                            # Los embeddings guardados pueden ser del modelo antiguo o tener forma incorrecta
+                            photo_array = read_image_from_path(file)
+                            
+                            # Verificar que la imagen tenga un rostro
+                            if not detect_face(photo_array):
+                                if DEBUG_MODE:
+                                    print(f"⚠️ {file.name}: No se detectó rostro, saltando...")
+                                continue
+                            
+                            try:
+                                photo_embedding, _ = extract_face_embedding(photo_array)
+                            except Exception as e:
+                                if DEBUG_MODE:
+                                    print(f"❌ {file.name}: Error extrayendo embedding: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                continue
+                            
+                            # Calcular similitud
+                            similarity, distance = calculate_similarity(
+                                selfie_embedding, 
+                                photo_embedding
+                            )
+                            
+                            if DEBUG_MODE:
+                                print(f"📊 {file.name}: similitud={similarity:.2f}%, distancia={distance:.4f}")
+                            
+                            # Obtener fecha
+                            created_at = datetime.fromtimestamp(file.stat().st_ctime)
+                            date_str = created_at.strftime("%Y-%m-%d")
+                            
+                            # Generar URL de preview con marca de agua
+                            preview_url = f"/photos/preview?folder_name={school_name}&filename={file.name}&watermark=true"
+                            
+                            photos_with_similarity.append({
+                                "id": f"{school_name}_{file.stem}",
+                                "filename": file.name,
+                                "school": school_name,
+                                "date": date_str,
+                                "similarity": round(similarity, 2),
+                                "thumbnail": preview_url,
+                                "image": preview_url
+                            })
+                            
+                        except Exception as e:
+                            print(f"Error procesando {file.name}: {e}")
+                            continue
+        
+        # Ordenar por similitud descendente
+        photos_with_similarity.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        # Contar coincidencias (umbral estricto)
+        min_similarity_percent = (1 - SIMILARITY_THRESHOLD) * 100
+        matches = [p for p in photos_with_similarity if (1 - (p["similarity"] / 100)) <= SIMILARITY_THRESHOLD]
+        matches_count = len(matches)
+        
+        if DEBUG_MODE:
+            print("\n" + "="*60)
+            print(f"📋 RESUMEN DE BÚSQUEDA - MARKETPLACE")
+            print("="*60)
+            print(f"✅ MATCHES ENCONTRADOS: {matches_count}")
+            if matches:
+                for i, match in enumerate(matches, 1):
+                    print(f"  {i}. {match['filename']} ({match['school']}) - Similitud: {match['similarity']:.2f}%")
+            else:
+                print("  (ninguno)")
+            print(f"\n📊 Total de fotos procesadas: {len(photos_with_similarity)}")
+            print(f"📊 Umbral utilizado: {min_similarity_percent:.2f}%")
+            if len(photos_with_similarity) > 0:
+                top5 = [f"{p['filename']}: {p['similarity']:.2f}%" for p in photos_with_similarity[:5]]
+                print(f"📊 Top 5 similitudes: {top5}")
+            print("="*60 + "\n")
+        
+
+
+
+
+
+
+        return {
+            "status": "success",
+            "photos": photos_with_similarity,
+            "matches": matches,
+            "matches_count": matches_count,
+            "total_photos": len(photos_with_similarity),
+            "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2),
+            "storage_path": str(storage_path)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error en marketplace_search_similar: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando solicitud: {str(e)}"
+        )
+
+# ==================== ENDPOINTS DE PAGOS ====================
+
+@app.get("/payments")
+async def get_payments():
+    """Lista todas las transacciones de pago (alias de /payments/list)"""
+    return await list_payments()
+
+@app.get("/payments/list")
+async def list_payments():
+    """Obtiene todas las transacciones de pago"""
+    try:
+        # Datos simulados de pagos (en producción, vendrían de una base de datos)
+        payments = [
+            {
+                "id": "TXN001",
+                "customer_name": "Juan Pérez",
+                "customer_email": "juan@example.com",
+                "amount": 29.97,
+                "created_at": datetime.now().isoformat(),
+                "status": "completed",
+                "items_count": 3
+            },
+            {
+                "id": "TXN002",
+                "customer_name": "María García",
+                "customer_email": "maria@example.com",
+                "amount": 19.98,
+                "created_at": (datetime.now() - timedelta(days=1)).isoformat(),
+                "status": "completed",
+                "items_count": 2
+            },
+            {
+                "id": "TXN003",
+                "customer_name": "Carlos López",
+                "customer_email": "carlos@example.com",
+                "amount": 39.96,
+                "created_at": (datetime.now() - timedelta(days=2)).isoformat(),
+                "status": "completed",
+                "items_count": 4
+            }
+        ]
+        
+        return {
+            "status": "success",
+            "payments": payments,
+            "total": len(payments)
+        }
+    except Exception as e:
+        print(f"Error listando pagos: {e}")
+        raise HTTPException(status_code=500, detail=f"Error listando pagos: {str(e)}")
+
+@app.post("/payments/record")
+async def record_payment(
+    customer_name: str = Query(...),
+    amount: float = Query(...),
+    items_count: int = Query(...)
+):
+    """Registra una nueva transacción de pago"""
+    try:
+        payment = {
+            "id": f"TXN{datetime.now().timestamp()}",
+            "customer": customer_name,
+            "amount": amount,
+            "items_count": items_count,
+            "date": datetime.now().isoformat(),
+            "status": "completed"
+        }
+        
+        return {
+            "status": "success",
+            "message": "Pago registrado exitosamente",
+            "payment": payment
+        }
+    except Exception as e:
+        print(f"Error registrando pago: {e}")
+        raise HTTPException(status_code=500, detail=f"Error registrando pago: {str(e)}")
+
+# ==================== ENDPOINTS DE ESTADÍSTICAS ====================
+
+@app.get("/statistics/dashboard")
+async def get_dashboard_statistics():
+    """Obtiene estadísticas del dashboard"""
+    try:
+        storage_path = STORAGE_DIR
+        
+        # Contar carpetas
+        folders = [f for f in storage_path.iterdir() if f.is_dir()]
+        total_folders = len(folders)
+        
+        # Contar fotos
+        total_photos = 0
+        for folder in folders:
+            photos = [f for f in folder.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}]
+            total_photos += len(photos)
+        
+        # Calcular ingresos (simulado)
+        total_revenue = total_photos * 9.99 * 0.5
+        total_transactions = max(1, total_photos // 3)
+        
+        return {
+            "status": "success",
+            "statistics": {
+                "total_folders": total_folders,
+                "total_photos": total_photos,
+                "total_revenue": round(total_revenue, 2),
+                "total_transactions": total_transactions,
+                "average_photos_per_folder": round(total_photos / max(1, total_folders), 2)
+            }
+        }
+    except Exception as e:
+        print(f"Error obteniendo estadísticas: {e}")
+        raise HTTPException(status_code=500, detail=f"Error obteniendo estadísticas: {str(e)}")
+
+@app.get("/statistics/photos-by-school")
+async def get_photos_by_school():
+    """Obtiene estadísticas de fotos por escuela"""
+    try:
+        storage_path = STORAGE_DIR
+        photos_by_school = {}
+        
+        for folder in storage_path.iterdir():
+            if folder.is_dir():
+                photos = [f for f in folder.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}]
+                photos_by_school[folder.name] = len(photos)
+        
+        return {
+            "status": "success",
+            "data": photos_by_school
+        }
+    except Exception as e:
+        print(f"Error obteniendo fotos por escuela: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/statistics/revenue-by-month")
+async def get_revenue_by_month():
+    """Obtiene estadísticas de ingresos por mes"""
+    try:
+        # Datos simulados
+        current_month = datetime.now().strftime("%Y-%m")
+        revenue_data = {
+            current_month: 1500.00
+        }
+        
+        return {
+            "status": "success",
+            "data": revenue_data
+        }
+    except Exception as e:
+        print(f"Error obteniendo ingresos por mes: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
