@@ -22,11 +22,12 @@ COPY requirements.txt .
 # Instalar dependencias Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código
-COPY main.py .
+# Copiar todo el código del backend
+COPY . .
 
-# Exponer puerto
+# Exponer puerto (Railway usa la variable PORT)
 EXPOSE 8000
 
 # Comando para iniciar la aplicación
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway inyecta la variable PORT automáticamente
+CMD python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
