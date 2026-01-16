@@ -1,1 +1,1 @@
-web: pip install --upgrade pip setuptools wheel && python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+web: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
