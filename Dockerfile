@@ -1,8 +1,8 @@
-FROM python:3.11
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instalar dependencias del sistema necesarias para OpenCV, TensorFlow y DeepFace
+# Instalar dependencias del sistema necesarias para OpenCV y InsightFace
 RUN apt-get update && apt-get install -y \
     build-essential \
     libsm6 \
@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     libgomp1 \
     libglib2.0-0 \
-    libgl1 \
+    libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
 # Actualizar pip y setuptools
@@ -30,4 +30,4 @@ EXPOSE 8000
 
 # Comando para iniciar la aplicación
 # Railway inyecta la variable PORT automáticamente
-CMD python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
