@@ -2,7 +2,7 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 numpy>=1.26.0
-opencv-python>=4.10.0
+opencv-python-headless>=4.10.0
 insightface>=0.7.3
 onnxruntime>=1.16.0
 scipy>=1.12.0
