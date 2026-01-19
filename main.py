@@ -470,10 +470,9 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
             print(f"⚡ Velocidad: {total_photos / total_time:.1f} fotos/segundo")
             print(f"✅ MATCHES ENCONTRADOS: {matches_count}")
             if matches_sorted:
-                for i, match in enumerate(matches_sorted[:10], 1):  # Mostrar solo top 10
+                # Mostrar TODOS los matches (son las fotos que el cliente comprará)
+                for i, match in enumerate(matches_sorted, 1):
                     print(f"  {i}. {match['file']} - Similitud: {match['similarity']:.2f}%")
-                if len(matches_sorted) > 10:
-                    print(f"  ... y {len(matches_sorted) - 10} más")
             else:
                 print("  (ninguno)")
             print(f"\n❌ NO MATCHES: {non_matches_count}")
