@@ -11,6 +11,8 @@ import shutil
 from typing import List
 from pathlib import Path
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 from stripe_endpoints import router as stripe_router
 from admin_endpoints import router as admin_router
 
@@ -49,6 +51,10 @@ MIN_FACE_SIZE = 20  # Tamaño mínimo del rostro en píxeles (reducido)
 MIN_FACE_CONFIDENCE = 0.3  # Confianza mínima del detector (reducida)
 USE_MULTIPLE_FACES = False  # NO usar múltiples rostros
 DEBUG_MODE = True  # Activar logging detallado
+
+# Configuración de procesamiento paralelo
+MAX_WORKERS = min(32, (multiprocessing.cpu_count() or 1) * 4)  # 4 threads por CPU
+BATCH_SIZE = 50  # Procesar en lotes de 50 fotos
 
 # Inicializar modelo InsightFace con mejores prácticas
 # Usar el modelo 'buffalo_l' que es el más preciso y robusto
@@ -298,7 +304,7 @@ def extract_face_embedding(image: np.ndarray):
 
 async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos_in_folder: List[Path]):
     """
-    Compara un selfie con fotos de una carpeta específica
+    Compara un selfie con fotos de una carpeta específica usando procesamiento paralelo.
     """
     try:
         # Validar que el selfie sea una imagen
@@ -323,62 +329,58 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         
         if DEBUG_MODE:
             print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
+            print(f"🚀 Procesando {len(photos_in_folder)} fotos en paralelo con {MAX_WORKERS} workers...")
         
-        # Procesar fotos de la carpeta
+        # Procesar fotos en paralelo
         matches = []
         non_matches = []
         errors = 0
         
-        for photo_path in photos_in_folder:
-            try:
-                # Leer foto desde disco
-                photo_array = read_image_from_path(photo_path)
+        start_time = datetime.now()
+        
+        # Usar ThreadPoolExecutor para procesamiento paralelo
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Enviar todas las tareas al pool
+            future_to_photo = {
+                executor.submit(process_single_photo, photo_path, selfie_embedding): photo_path
+                for photo_path in photos_in_folder
+            }
+            
+            # Procesar resultados a medida que se completan
+            completed = 0
+            for future in as_completed(future_to_photo):
+                completed += 1
                 
-                # Detectar rostro
-                if not detect_face(photo_array):
-                    non_matches.append({
-                        "file": photo_path.name,
-                        "similarity": 0,
-                        "reason": "No se detectó rostro"
-                    })
-                    continue
+                # Mostrar progreso cada 10 fotos
+                if DEBUG_MODE and completed % 10 == 0:
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    print(f"⏳ Progreso: {completed}/{len(photos_in_folder)} fotos ({rate:.1f} fotos/seg)")
                 
-                # Extraer embedding
-                photo_embedding, _ = extract_face_embedding(photo_array)
-                
-                # Calcular similitud
-                similarity, distance = calculate_similarity(
-                    selfie_embedding, 
-                    photo_embedding
-                )
-                
-                # Umbral muy permisivo: aceptar cualquier similitud >= 30%
-                min_similarity_percent = (1 - SIMILARITY_THRESHOLD) * 100
-                
-                if DEBUG_MODE:
-                    print(f"📊 {photo_path.name}: similitud={similarity:.2f}%, distancia={distance:.4f}, umbral={SIMILARITY_THRESHOLD}")
-                
-                # Aceptar solo si la distancia es <= umbral
-                if distance <= SIMILARITY_THRESHOLD:
-                    matches.append({
-                        "file": photo_path.name,
-                        "similarity": similarity
-                    })
-                    if DEBUG_MODE:
-                        print(f"✅ MATCH: {photo_path.name} (similitud: {similarity:.2f}%)")
-                else:
-                    non_matches.append({
-                        "file": photo_path.name,
-                        "similarity": similarity,
-                        "reason": f"Similitud {similarity:.2f}% por debajo del umbral {min_similarity_percent:.2f}%"
-                    })
-                    if DEBUG_MODE:
-                        print(f"❌ NO MATCH: {photo_path.name} (similitud: {similarity:.2f}%)")
+                try:
+                    result = future.result()
                     
-            except Exception as e:
-                print(f"Error procesando {photo_path.name}: {e}")
-                errors += 1
-                continue
+                    if result.get("error"):
+                        errors += 1
+                    elif result["is_match"]:
+                        matches.append({
+                            "file": result["file"],
+                            "similarity": result["similarity"]
+                        })
+                    else:
+                        non_matches.append({
+                            "file": result["file"],
+                            "similarity": result["similarity"],
+                            "reason": result.get("reason", "No coincide")
+                        })
+                        
+                except Exception as e:
+                    photo_path = future_to_photo[future]
+                    print(f"❌ Error procesando resultado de {photo_path.name}: {e}")
+                    errors += 1
+        
+        # Calcular tiempo total
+        total_time = (datetime.now() - start_time).total_seconds()
         
         # Calcular estadísticas
         total_photos = len(photos_in_folder)
@@ -394,13 +396,18 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
             print("\n" + "="*60)
             print(f"📋 RESUMEN DE BÚSQUEDA - {folder_name}")
             print("="*60)
+            print(f"⏱️  Tiempo total: {total_time:.2f} segundos")
+            print(f"⚡ Velocidad: {total_photos / total_time:.1f} fotos/segundo")
             print(f"✅ MATCHES ENCONTRADOS: {matches_count}")
             if matches_sorted:
-                for i, match in enumerate(matches_sorted, 1):
+                for i, match in enumerate(matches_sorted[:10], 1):  # Mostrar solo top 10
                     print(f"  {i}. {match['file']} - Similitud: {match['similarity']:.2f}%")
+                if len(matches_sorted) > 10:
+                    print(f"  ... y {len(matches_sorted) - 10} más")
             else:
                 print("  (ninguno)")
             print(f"\n❌ NO MATCHES: {non_matches_count}")
+            print(f"⚠️  ERRORES: {errors}")
             print(f"📊 Porcentaje de coincidencia: {match_percentage:.2f}%")
             print("="*60 + "\n")
         
@@ -416,7 +423,9 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
                 "non_matches_count": non_matches_count,
                 "errors_count": errors,
                 "match_percentage": round(match_percentage, 2),
-                "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2)
+                "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2),
+                "processing_time_seconds": round(total_time, 2),
+                "photos_per_second": round(total_photos / total_time, 2) if total_time > 0 else 0
             }
         }
         
@@ -473,6 +482,70 @@ def calculate_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> tupl
     
     # Convertir a float nativo de Python (no numpy.float32)
     return float(round(similarity, 2)), float(round(cosine_distance, 4))
+
+def process_single_photo(photo_path: Path, selfie_embedding: np.ndarray) -> dict:
+    """
+    Procesa una sola foto y la compara con el selfie.
+    Esta función se ejecuta en paralelo.
+    
+    Args:
+        photo_path: Ruta de la foto a procesar
+        selfie_embedding: Embedding del selfie para comparar
+    
+    Returns:
+        dict con resultado de la comparación
+    """
+    try:
+        # Leer foto desde disco
+        photo_array = read_image_from_path(photo_path)
+        
+        # Detectar rostro
+        if not detect_face(photo_array):
+            return {
+                "file": photo_path.name,
+                "similarity": 0,
+                "reason": "No se detectó rostro",
+                "is_match": False
+            }
+        
+        # Extraer embedding
+        photo_embedding, _ = extract_face_embedding(photo_array)
+        
+        # Calcular similitud
+        similarity, distance = calculate_similarity(
+            selfie_embedding, 
+            photo_embedding
+        )
+        
+        # Determinar si es match
+        is_match = distance <= SIMILARITY_THRESHOLD
+        
+        result = {
+            "file": photo_path.name,
+            "similarity": similarity,
+            "distance": distance,
+            "is_match": is_match
+        }
+        
+        if not is_match:
+            min_similarity_percent = (1 - SIMILARITY_THRESHOLD) * 100
+            result["reason"] = f"Similitud {similarity:.2f}% por debajo del umbral {min_similarity_percent:.2f}%"
+        
+        if DEBUG_MODE:
+            status = "✅ MATCH" if is_match else "❌ NO MATCH"
+            print(f"{status}: {photo_path.name} (similitud: {similarity:.2f}%)")
+        
+        return result
+        
+    except Exception as e:
+        print(f"❌ Error procesando {photo_path.name}: {e}")
+        return {
+            "file": photo_path.name,
+            "similarity": 0,
+            "reason": f"Error: {str(e)}",
+            "is_match": False,
+            "error": True
+        }
 
 @app.post("/compare-faces-folder")
 async def compare_faces_folder(
