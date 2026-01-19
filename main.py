@@ -698,18 +698,30 @@ async def list_folders():
         for folder in storage_path.iterdir():
             if folder.is_dir():
                 metadata_path = folder / "metadata.json"
+                metadata = {}
                 if metadata_path.exists():
                     with open(metadata_path, 'r') as f:
                         metadata = json.load(f)
-                    
-                    # Contar fotos
-                    photo_count = len([f for f in folder.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}])
-                    
-                    folders.append({
-                        "name": folder.name,
-                        "created_at": metadata.get("created_at"),
-                        "photo_count": photo_count
-                    })
+                
+                # Contar fotos (excluyendo cover.jpg)
+                photo_count = len([f for f in folder.iterdir() 
+                                  if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'} 
+                                  and not f.name.startswith('cover')])
+                
+                # Verificar si existe portada
+                cover_image = metadata.get("cover_image")
+                if not cover_image:
+                    # Buscar archivo de portada físicamente
+                    cover_path = folder / "cover.jpg"
+                    if cover_path.exists():
+                        cover_image = "cover.jpg"
+                
+                folders.append({
+                    "name": folder.name,
+                    "created_at": metadata.get("created_at", datetime.now().isoformat()),
+                    "photo_count": photo_count,
+                    "cover_image": cover_image
+                })
         
         return {
             "status": "success",
@@ -784,8 +796,18 @@ async def set_folder_cover(
         if not validate_image_file(cover_image):
             raise HTTPException(status_code=400, detail="El archivo debe ser una imagen válida")
         
-        # Guardar imagen de portada
-        cover_filename = f"cover_{cover_image.filename}"
+        # IMPORTANTE: Eliminar todas las portadas antiguas antes de guardar la nueva
+        # Esto evita conflictos con archivos antiguos como cover_7N5A1557.JPG
+        for old_cover in folder_path.glob("cover*"):
+            if old_cover.is_file():
+                try:
+                    old_cover.unlink()
+                    print(f"🗑️ Portada antigua eliminada: {old_cover.name}")
+                except Exception as e:
+                    print(f"⚠️ Error eliminando portada antigua {old_cover.name}: {e}")
+        
+        # Guardar imagen de portada con nombre fijo
+        cover_filename = "cover.jpg"
         cover_path = folder_path / cover_filename
         
         contents = await cover_image.read()
@@ -810,6 +832,8 @@ async def set_folder_cover(
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
+        print(f"✅ Portada guardada: {cover_path}")
+        
         return {
             "status": "success",
             "message": "Imagen de portada actualizada",
@@ -819,6 +843,128 @@ async def set_folder_cover(
         raise
     except Exception as e:
         print(f"Error estableciendo portada: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/folders/cover/{folder_name}")
+async def get_folder_cover(folder_name: str):
+    """Obtiene la imagen de portada de una carpeta"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        
+        if not folder_path.exists():
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+        
+        # Buscar archivo de portada
+        cover_path = folder_path / "cover.jpg"
+        
+        if not cover_path.exists():
+            # Intentar con otros nombres posibles
+            for ext in ['.png', '.jpeg', '.gif']:
+                alt_path = folder_path / f"cover{ext}"
+                if alt_path.exists():
+                    cover_path = alt_path
+                    break
+            else:
+                raise HTTPException(status_code=404, detail="No hay portada asignada")
+        
+        # Leer y devolver la imagen
+        with open(cover_path, 'rb') as f:
+            content = f.read()
+        
+        # Determinar content type
+        content_type = "image/jpeg"
+        if cover_path.suffix.lower() == '.png':
+            content_type = "image/png"
+        elif cover_path.suffix.lower() == '.gif':
+            content_type = "image/gif"
+        
+        return Response(content=content, media_type=content_type)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error obteniendo portada: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/folders/set-day-cover")
+async def set_day_cover(
+    folder_name: str = Query(...),
+    day_date: str = Query(...),
+    cover_image: UploadFile = File(...)
+):
+    """Establece la imagen de portada de un día específico"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        day_folder_path = folder_path / day_date
+        
+        if not day_folder_path.exists():
+            raise HTTPException(status_code=404, detail="El día no existe")
+        
+        # Validar que sea una imagen
+        if not validate_image_file(cover_image):
+            raise HTTPException(status_code=400, detail="El archivo debe ser una imagen válida")
+        
+        # Guardar imagen de portada con nombre fijo
+        cover_filename = "cover.jpg"
+        cover_path = day_folder_path / cover_filename
+        
+        contents = await cover_image.read()
+        with open(cover_path, 'wb') as f:
+            f.write(contents)
+        
+        print(f"✅ Portada del día guardada: {cover_path}")
+        
+        return {
+            "status": "success",
+            "message": "Imagen de portada del día actualizada",
+            "cover_image": cover_filename
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error estableciendo portada del día: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/folders/{folder_name}/day-cover/{day_date}")
+async def get_day_cover(folder_name: str, day_date: str):
+    """Obtiene la imagen de portada de un día específico"""
+    try:
+        folder_path = STORAGE_DIR / folder_name
+        day_folder_path = folder_path / day_date
+        
+        if not day_folder_path.exists():
+            raise HTTPException(status_code=404, detail="El día no existe")
+        
+        # Buscar archivo de portada
+        cover_path = day_folder_path / "cover.jpg"
+        
+        if not cover_path.exists():
+            # Intentar con otros nombres posibles
+            for ext in ['.png', '.jpeg', '.gif']:
+                alt_path = day_folder_path / f"cover{ext}"
+                if alt_path.exists():
+                    cover_path = alt_path
+                    break
+            else:
+                raise HTTPException(status_code=404, detail="No hay portada asignada")
+        
+        # Leer y devolver la imagen
+        with open(cover_path, 'rb') as f:
+            content = f.read()
+        
+        # Determinar content type
+        content_type = "image/jpeg"
+        if cover_path.suffix.lower() == '.png':
+            content_type = "image/png"
+        elif cover_path.suffix.lower() == '.gif':
+            content_type = "image/gif"
+        
+        return Response(content=content, media_type=content_type)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error obteniendo portada del día: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.post("/folders/create-day")
