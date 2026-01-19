@@ -197,14 +197,18 @@ def read_image_from_path(file_path: Path) -> np.ndarray:
     
     return image_array
 
-def detect_face(image: np.ndarray) -> bool:
+def detect_face(image: np.ndarray, is_selfie: bool = False) -> bool:
     """
     Detecta si hay un rostro en la imagen usando múltiples métodos y técnicas.
     
+    Args:
+        image: Imagen en formato numpy array (BGR)
+        is_selfie: Si es True, usa criterios MUY permisivos para selfies
+    
     Intenta:
     1. InsightFace con imagen original
-    2. InsightFace con imagen mejorada
-    3. InsightFace con imagen rotada (si está habilitado)
+    2. InsightFace con imagen mejorada (contraste, brillo)
+    3. InsightFace con múltiples escalas
     4. OpenCV Haar Cascade como fallback
     """
     try:
@@ -217,44 +221,101 @@ def detect_face(image: np.ndarray) -> bool:
         elif image.shape[2] == 4:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
         
-        # Detectar con InsightFace en imagen original
+        # MÉTODO 1: Detectar con InsightFace en imagen original
         faces = face_analysis.get(image)
         if len(faces) > 0:
             for face in faces:
                 bbox = face.bbox.astype(int)
                 face_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-                # Criterios de validación
-                if face_size >= MIN_FACE_SIZE and face.det_score >= MIN_FACE_CONFIDENCE:
+                
+                # Para selfies, ser EXTREMADAMENTE permisivo
+                if is_selfie:
+                    # Aceptar cualquier rostro detectado, sin importar tamaño o confianza
+                    if DEBUG_MODE:
+                        print(f"✅ Rostro detectado en selfie: tamaño={face_size}px, confianza={face.det_score:.3f}")
                     return True
-                # Si el rostro es grande, aceptarlo incluso con menor confianza
-                if face_size >= MIN_FACE_SIZE * 2:
+                else:
+                    # Para fotos de surf, usar criterios normales
+                    if face_size >= MIN_FACE_SIZE and face.det_score >= MIN_FACE_CONFIDENCE:
+                        return True
+                    if face_size >= MIN_FACE_SIZE * 2:
+                        return True
+        
+        # MÉTODO 2: Mejorar imagen y volver a intentar
+        try:
+            # Mejorar contraste y brillo
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+            
+            faces = face_analysis.get(enhanced)
+            if len(faces) > 0:
+                if is_selfie:
+                    if DEBUG_MODE:
+                        print(f"✅ Rostro detectado en selfie (imagen mejorada)")
                     return True
+                else:
+                    for face in faces:
+                        bbox = face.bbox.astype(int)
+                        face_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+                        if face_size >= MIN_FACE_SIZE:
+                            return True
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"⚠️ Error mejorando imagen: {e}")
+        
+        # MÉTODO 3: Probar con diferentes escalas
+        if is_selfie:
+            try:
+                height, width = image.shape[:2]
+                for scale in [0.5, 0.75, 1.5, 2.0]:
+                    new_width = int(width * scale)
+                    new_height = int(height * scale)
+                    resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+                    
+                    faces = face_analysis.get(resized)
+                    if len(faces) > 0:
+                        if DEBUG_MODE:
+                            print(f"✅ Rostro detectado en selfie (escala {scale}x)")
+                        return True
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"⚠️ Error probando escalas: {e}")
+        
+        # MÉTODO 4: Fallback a OpenCV Haar Cascade (solo para selfies)
+        if is_selfie:
+            try:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+                face_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                )
+                
+                # Parámetros MUY permisivos para selfies
+                for scale in [1.05, 1.1, 1.15, 1.2]:
+                    for neighbors in [1, 2, 3]:
+                        faces = face_cascade.detectMultiScale(
+                            gray,
+                            scaleFactor=scale,
+                            minNeighbors=neighbors,
+                            minSize=(10, 10),  # Tamaño mínimo muy pequeño
+                            flags=cv2.CASCADE_SCALE_IMAGE
+                        )
+                        if len(faces) > 0:
+                            if DEBUG_MODE:
+                                print(f"✅ Rostro detectado en selfie (OpenCV Haar)")
+                            return True
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"⚠️ Error con Haar Cascade: {e}")
         
         return False
         
     except Exception as e:
-        print(f"Error detectando rostro con InsightFace: {e}")
-        # Fallback a OpenCV Haar Cascade
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-            face_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            )
-            # Intentar con parámetros más flexibles
-            for scale in [1.1, 1.05]:
-                for neighbors in [3, 2]:
-                    faces = face_cascade.detectMultiScale(
-                        gray,
-                        scaleFactor=scale,
-                        minNeighbors=neighbors,
-                        minSize=(MIN_FACE_SIZE, MIN_FACE_SIZE),
-                        flags=cv2.CASCADE_SCALE_IMAGE
-                    )
-                    if len(faces) > 0:
-                        return True
-            return False
-        except:
-            return False
+        print(f"❌ Error detectando rostro: {e}")
+        return False
 
 def extract_face_embedding(image: np.ndarray):
     """
@@ -317,8 +378,17 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         # Leer el selfie
         selfie_array = await read_image_to_array(selfie)
         
-        # Detectar rostro en el selfie
-        if not detect_face(selfie_array):
+        # Detectar rostro en el selfie (usar modo permisivo para selfies)
+        if not detect_face(selfie_array, is_selfie=True):
+            raise HTTPException(
+                status_code=400,
+                detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
+            )
+        # Leer el selfie
+        selfie_array = await read_image_to_array(selfie)
+        
+        # Detectar rostro en el selfie (usar modo permisivo para selfies)
+        if not detect_face(selfie_array, is_selfie=True):
             raise HTTPException(
                 status_code=400,
                 detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
@@ -1493,8 +1563,8 @@ async def search_similar(selfie: UploadFile = File(...)):
         # Leer el selfie
         selfie_array = await read_image_to_array(selfie)
         
-        # Detectar rostro en el selfie
-        if not detect_face(selfie_array):
+        # Detectar rostro en el selfie (usar modo permisivo para selfies)
+        if not detect_face(selfie_array, is_selfie=True):
             raise HTTPException(
                 status_code=400,
                 detail="No se detectó un rostro en el selfie"
