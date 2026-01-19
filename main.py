@@ -150,34 +150,106 @@ async def read_image_to_array(file: UploadFile) -> np.ndarray:
     
     Aplica mejoras de calidad de imagen para optimizar la detección facial.
     """
-    contents = await file.read()
-    
-    # Validar tamaño
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB")
-    
-    # Convertir a imagen
-    image = Image.open(io.BytesIO(contents))
-    image_array = np.array(image)
-    
-    # Convertir a BGR si es necesario (OpenCV usa BGR)
-    if len(image_array.shape) == 3 and image_array.shape[2] == 4:
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
-    elif len(image_array.shape) == 3 and image_array.shape[2] == 3:
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-    
-    # Preprocesamiento básico: asegurar que la imagen tenga buen tamaño
-    # Si es muy pequeña, redimensionar (pero mantener aspecto)
-    height, width = image_array.shape[:2]
-    min_dimension = 200  # Tamaño mínimo recomendado
-    
-    if min(height, width) < min_dimension:
-        scale = min_dimension / min(height, width)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
-        image_array = cv2.resize(image_array, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-    
-    return image_array
+    try:
+        contents = await file.read()
+        
+        # Validar que el archivo no esté vacío
+        if len(contents) == 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="El archivo está vacío. Por favor, sube una imagen válida."
+            )
+        
+        # Validar tamaño
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB"
+            )
+        
+        # Intentar abrir la imagen
+        try:
+            image = Image.open(io.BytesIO(contents))
+            # Verificar que la imagen se pueda cargar
+            image.verify()
+            
+            # Reabrir la imagen después de verify (verify cierra el archivo)
+            image = Image.open(io.BytesIO(contents))
+            
+        except Exception as e:
+            print(f"❌ Error abriendo imagen: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"El archivo no es una imagen válida o está corrupto. Formatos soportados: JPG, PNG, GIF, BMP. Error: {str(e)}"
+            )
+        
+        # Convertir a array numpy
+        try:
+            image_array = np.array(image)
+        except Exception as e:
+            print(f"❌ Error convirtiendo imagen a array: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Error procesando la imagen. Por favor, intenta con otra imagen."
+            )
+        
+        # Validar que la imagen tenga dimensiones válidas
+        if image_array.size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="La imagen no tiene contenido válido."
+            )
+        
+        # Convertir a BGR si es necesario (OpenCV usa BGR)
+        if len(image_array.shape) == 2:
+            # Imagen en escala de grises, convertir a BGR
+            image_array = cv2.cvtColor(image_array, cv2.COLOR_GRAY2BGR)
+        elif len(image_array.shape) == 3:
+            if image_array.shape[2] == 4:
+                # RGBA a BGR
+                image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
+            elif image_array.shape[2] == 3:
+                # RGB a BGR
+                image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Formato de imagen no soportado. Usa JPG, PNG, GIF o BMP."
+            )
+        
+        # Preprocesamiento básico: asegurar que la imagen tenga buen tamaño
+        # Si es muy pequeña, redimensionar (pero mantener aspecto)
+        height, width = image_array.shape[:2]
+        
+        if height == 0 or width == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="La imagen tiene dimensiones inválidas."
+            )
+        
+        min_dimension = 200  # Tamaño mínimo recomendado
+        
+        if min(height, width) < min_dimension:
+            scale = min_dimension / min(height, width)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            image_array = cv2.resize(image_array, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        
+        if DEBUG_MODE:
+            print(f"✅ Imagen cargada: {width}x{height} -> {image_array.shape}")
+        
+        return image_array
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error inesperado en read_image_to_array: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error procesando la imagen: {str(e)}"
+        )
 
 def read_image_from_path(file_path: Path) -> np.ndarray:
     """Lee una imagen desde un archivo en disco y la convierte a array numpy"""
