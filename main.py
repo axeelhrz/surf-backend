@@ -447,16 +447,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
                 detail="El selfie debe ser una imagen válida (JPG, PNG, GIF, BMP)"
             )
         
-        # Leer el selfie
-        selfie_array = await read_image_to_array(selfie)
-        
-        # Detectar rostro en el selfie (usar modo permisivo para selfies)
-        if not detect_face(selfie_array, is_selfie=True):
-            raise HTTPException(
-                status_code=400,
-                detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
-            )
-        # Leer el selfie
+        # Leer el selfie UNA SOLA VEZ
         selfie_array = await read_image_to_array(selfie)
         
         # Detectar rostro en el selfie (usar modo permisivo para selfies)
