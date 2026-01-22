@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import json
 from payment_service import PaymentService
+from embeddings_clustering import EmbeddingsClusteringSystem
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -14,6 +15,14 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 BASE_DIR = Path(__file__).parent.absolute()
 STORAGE_DIR = BASE_DIR / "photos_storage"
 PAYMENTS_DIR = BASE_DIR / "payments_storage"
+EMBEDDINGS_DIR = BASE_DIR / "embeddings_storage"
+
+# Inicializar sistema de clustering
+clustering_system = EmbeddingsClusteringSystem(
+    storage_dir=STORAGE_DIR,
+    embeddings_dir=EMBEDDINGS_DIR,
+    debug=True
+)
 
 @router.get("/dashboard/stats")
 async def get_dashboard_stats():
@@ -286,4 +295,111 @@ async def get_settings():
         }
     except Exception as e:
         print(f"Error obteniendo configuración: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@router.post("/embeddings/process")
+async def process_embeddings(
+    folder_name: str = Query(...),
+    day: Optional[str] = Query(None),
+    force: bool = Query(False)
+):
+    """
+    Procesa embeddings y crea clusters para una carpeta/día específico.
+    
+    Args:
+        folder_name: Nombre de la carpeta
+        day: Día específico (opcional)
+        force: Forzar re-procesamiento aunque ya existan clusters
+    """
+    try:
+        result = clustering_system.process_folder(
+            folder_name=folder_name,
+            day=day,
+            force=force
+        )
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error procesando embeddings: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@router.get("/embeddings/status")
+async def get_embeddings_status(
+    folder_name: str = Query(...),
+    day: Optional[str] = Query(None)
+):
+    """
+    Obtiene el estado de los embeddings de una carpeta/día.
+    
+    Args:
+        folder_name: Nombre de la carpeta
+        day: Día específico (opcional)
+    """
+    try:
+        clusters_data = clustering_system.load_clusters(folder_name, day)
+        
+        if clusters_data is None:
+            return {
+                "status": "not_processed",
+                "message": "No se han procesado embeddings para esta carpeta/día",
+                "has_embeddings": False
+            }
+        
+        metadata = clusters_data["metadata"]
+        
+        return {
+            "status": "processed",
+            "message": "Embeddings procesados correctamente",
+            "has_embeddings": True,
+            "metadata": {
+                "created_at": metadata["created_at"],
+                "total_photos": metadata["total_photos"],
+                "successful_embeddings": metadata["successful_embeddings"],
+                "failed_embeddings": metadata["failed_embeddings"],
+                "n_clusters": metadata["n_clusters"],
+                "silhouette_score": metadata["silhouette_score"],
+                "cluster_stats": metadata["cluster_stats"],
+                "processing_time": metadata["embedding_extraction_time"] + metadata["clustering_time"]
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error obteniendo estado de embeddings: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@router.delete("/embeddings/delete")
+async def delete_embeddings(
+    folder_name: str = Query(...),
+    day: Optional[str] = Query(None)
+):
+    """
+    Elimina los embeddings y clusters de una carpeta/día.
+    
+    Args:
+        folder_name: Nombre de la carpeta
+        day: Día específico (opcional)
+    """
+    try:
+        if day:
+            embeddings_path = EMBEDDINGS_DIR / folder_name / day
+        else:
+            embeddings_path = EMBEDDINGS_DIR / folder_name
+        
+        if not embeddings_path.exists():
+            raise HTTPException(status_code=404, detail="No existen embeddings para esta carpeta/día")
+        
+        # Eliminar directorio de embeddings
+        import shutil
+        shutil.rmtree(embeddings_path)
+        
+        return {
+            "status": "success",
+            "message": f"Embeddings eliminados correctamente"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error eliminando embeddings: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

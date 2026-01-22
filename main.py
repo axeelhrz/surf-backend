@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from stripe_endpoints import router as stripe_router
 from admin_endpoints import router as admin_router
+from embeddings_clustering import EmbeddingsClusteringSystem
 
 # Crear aplicación FastAPI
 app = FastAPI(
@@ -111,8 +112,16 @@ EMBEDDINGS_DIR = BASE_DIR / "embeddings_storage"
 STORAGE_DIR.mkdir(exist_ok=True)
 EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
+# Inicializar sistema de clustering
+clustering_system = EmbeddingsClusteringSystem(
+    storage_dir=STORAGE_DIR,
+    embeddings_dir=EMBEDDINGS_DIR,
+    debug=DEBUG_MODE
+)
+
 print(f"📁 STORAGE_DIR: {STORAGE_DIR}")
 print(f"📁 STORAGE_DIR existe: {STORAGE_DIR.exists()}")
+print(f"📁 EMBEDDINGS_DIR: {EMBEDDINGS_DIR}")
 
 @app.get("/health")
 async def health_check():
@@ -1295,9 +1304,17 @@ async def delete_folder(folder_name: str = Query(...)):
 @app.post("/photos/upload")
 async def upload_photos(
     folder_name: str = Query(...),
-    photos: List[UploadFile] = File(...)
+    photos: List[UploadFile] = File(...),
+    day: str = Query(None)
 ):
-    """Sube fotos a una carpeta específica (subida rápida sin procesamiento)"""
+    """
+    Sube fotos a una carpeta específica y procesa embeddings automáticamente.
+    
+    Args:
+        folder_name: Nombre de la carpeta
+        photos: Lista de fotos a subir
+        day: Día específico (opcional)
+    """
     try:
         folder_path = STORAGE_DIR / folder_name
         
@@ -1307,8 +1324,24 @@ async def upload_photos(
         if len(photos) == 0:
             raise HTTPException(status_code=400, detail="Debe proporcionar al menos una foto")
         
+        # Determinar ruta de destino
+        if day:
+            # Crear subcarpeta del día si no existe
+            day_folder_path = folder_path / day
+            day_folder_path.mkdir(parents=True, exist_ok=True)
+            upload_path = day_folder_path
+            label = f"{folder_name}/{day}"
+        else:
+            upload_path = folder_path
+            label = folder_name
+        
         uploaded_photos = []
         errors = []
+        
+        # Paso 1: Subir fotos
+        print(f"\n{'='*60}")
+        print(f"📤 SUBIENDO FOTOS - {label}")
+        print(f"{'='*60}")
         
         for photo in photos:
             try:
@@ -1326,8 +1359,8 @@ async def upload_photos(
                     errors.append(f"{photo.filename}: Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB")
                     continue
                 
-                # Guardar foto directamente sin procesamiento
-                photo_path = folder_path / photo.filename
+                # Guardar foto directamente
+                photo_path = upload_path / photo.filename
                 with open(photo_path, 'wb') as f:
                     f.write(contents)
                 
@@ -1344,13 +1377,49 @@ async def upload_photos(
             except Exception as e:
                 errors.append(f"{photo.filename}: {str(e)}")
         
-        return {
+        # Paso 2: Procesar embeddings automáticamente
+        embeddings_result = None
+        if len(uploaded_photos) > 0:
+            try:
+                print(f"\n🔄 Procesando embeddings automáticamente...")
+                embeddings_result = clustering_system.process_folder(
+                    folder_name=folder_name,
+                    day=day,
+                    force=True  # Forzar re-procesamiento para incluir nuevas fotos
+                )
+                
+                if embeddings_result["status"] == "success":
+                    print(f"✅ Embeddings procesados: {embeddings_result['n_clusters']} clusters creados")
+                else:
+                    print(f"⚠️ Advertencia procesando embeddings: {embeddings_result.get('message', 'Error desconocido')}")
+                    
+            except Exception as e:
+                print(f"⚠️ Error procesando embeddings (no crítico): {e}")
+                embeddings_result = {
+                    "status": "error",
+                    "message": str(e)
+                }
+        
+        response = {
             "status": "success",
             "uploaded": len(uploaded_photos),
             "photos": uploaded_photos,
             "errors": errors,
             "message": f"{len(uploaded_photos)} fotos subidas correctamente"
         }
+        
+        # Agregar información de embeddings si se procesaron
+        if embeddings_result:
+            response["embeddings"] = {
+                "status": embeddings_result["status"],
+                "message": embeddings_result.get("message", ""),
+                "n_clusters": embeddings_result.get("n_clusters"),
+                "successful_embeddings": embeddings_result.get("successful_embeddings"),
+                "processing_time": embeddings_result.get("total_time")
+            }
+        
+        return response
+        
     except HTTPException:
         raise
     except Exception as e:
