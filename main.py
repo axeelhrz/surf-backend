@@ -444,9 +444,11 @@ def extract_face_embedding(image: np.ndarray):
         print(f"Error extrayendo embedding: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando imagen: {str(e)}")
 
-async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos_in_folder: List[Path]):
+async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos_in_folder: List[Path], search_day: str = None):
     """
-    Compara un selfie con fotos de una carpeta específica usando procesamiento paralelo.
+    Compara un selfie con fotos de una carpeta específica usando clustering optimizado.
+    
+    OPTIMIZACIÓN: Si existen clusters pre-calculados, busca solo en los clusters más relevantes.
     """
     try:
         # Validar que el selfie sea una imagen
@@ -471,7 +473,48 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         
         if DEBUG_MODE:
             print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
-            print(f"🚀 Procesando {len(photos_in_folder)} fotos en paralelo con {MAX_WORKERS} workers...")
+        
+        # OPTIMIZACIÓN: Intentar cargar clusters pre-calculados
+        clusters_data = clustering_system.load_clusters(folder_name, search_day)
+        
+        if clusters_data is not None:
+            # ✅ BÚSQUEDA OPTIMIZADA CON CLUSTERS
+            if DEBUG_MODE:
+                print(f"🎯 Usando búsqueda optimizada con clusters")
+                print(f"📊 Clusters disponibles: {clusters_data['metadata']['n_clusters']}")
+            
+            # Encontrar clusters más relevantes
+            relevant_clusters = clustering_system.find_relevant_clusters(
+                selfie_embedding,
+                clusters_data['centroids'],
+                top_k=3  # Buscar en los 3 clusters más similares
+            )
+            
+            # Obtener fotos solo de los clusters relevantes
+            photos_to_search = []
+            for cluster_id in relevant_clusters:
+                # Obtener índices de fotos en este cluster
+                cluster_mask = clusters_data['labels'] == cluster_id
+                cluster_filenames = [clusters_data['filenames'][i] for i, mask in enumerate(cluster_mask) if mask]
+                
+                # Agregar rutas completas
+                for filename in cluster_filenames:
+                    photo_path = photos_in_folder[0].parent / filename
+                    if photo_path.exists():
+                        photos_to_search.append(photo_path)
+            
+            if DEBUG_MODE:
+                print(f"🔍 Buscando en {len(photos_to_search)} fotos de {len(photos_in_folder)} totales ({len(photos_to_search)/len(photos_in_folder)*100:.1f}%)")
+                print(f"⚡ Aceleración estimada: {len(photos_in_folder)/max(1, len(photos_to_search)):.1f}x")
+        else:
+            # ⚠️ BÚSQUEDA TRADICIONAL (sin clusters)
+            if DEBUG_MODE:
+                print(f"⚠️ No hay clusters pre-calculados, usando búsqueda tradicional")
+                print(f"💡 Tip: Los embeddings se procesarán automáticamente al subir fotos")
+            photos_to_search = photos_in_folder
+        
+        if DEBUG_MODE:
+            print(f"🚀 Procesando {len(photos_to_search)} fotos en paralelo con {MAX_WORKERS} workers...")
         
         # Procesar fotos en paralelo
         matches = []
@@ -485,7 +528,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
             # Enviar todas las tareas al pool
             future_to_photo = {
                 executor.submit(process_single_photo, photo_path, selfie_embedding): photo_path
-                for photo_path in photos_in_folder
+                for photo_path in photos_to_search
             }
             
             # Procesar resultados a medida que se completan
@@ -497,7 +540,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
                 if DEBUG_MODE and completed % 10 == 0:
                     elapsed = (datetime.now() - start_time).total_seconds()
                     rate = completed / elapsed if elapsed > 0 else 0
-                    print(f"⏳ Progreso: {completed}/{len(photos_in_folder)} fotos ({rate:.1f} fotos/seg)")
+                    print(f"⏳ Progreso: {completed}/{len(photos_to_search)} fotos ({rate:.1f} fotos/seg)")
                 
                 try:
                     result = future.result()
@@ -526,6 +569,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         
         # Calcular estadísticas
         total_photos = len(photos_in_folder)
+        photos_searched = len(photos_to_search)
         matches_count = len(matches)
         non_matches_count = len(non_matches)
         match_percentage = (matches_count / total_photos * 100) if total_photos > 0 else 0
@@ -538,8 +582,11 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
             print("\n" + "="*60)
             print(f"📋 RESUMEN DE BÚSQUEDA - {folder_name}")
             print("="*60)
+            if clusters_data:
+                print(f"🎯 Búsqueda optimizada con clusters")
+                print(f"📊 Fotos analizadas: {photos_searched}/{total_photos} ({photos_searched/total_photos*100:.1f}%)")
             print(f"⏱️  Tiempo total: {total_time:.2f} segundos")
-            print(f"⚡ Velocidad: {total_photos / total_time:.1f} fotos/segundo")
+            print(f"⚡ Velocidad: {photos_searched / total_time:.1f} fotos/segundo")
             print(f"✅ MATCHES ENCONTRADOS: {matches_count}")
             if matches_sorted:
                 # Mostrar TODOS los matches (son las fotos que el cliente comprará)
@@ -560,13 +607,16 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
             "non_matches": non_matches,
             "statistics": {
                 "total_photos": total_photos,
+                "photos_searched": photos_searched,
                 "matches_count": matches_count,
                 "non_matches_count": non_matches_count,
                 "errors_count": errors,
                 "match_percentage": round(match_percentage, 2),
                 "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2),
                 "processing_time_seconds": round(total_time, 2),
-                "photos_per_second": round(total_photos / total_time, 2) if total_time > 0 else 0
+                "photos_per_second": round(photos_searched / total_time, 2) if total_time > 0 else 0,
+                "used_clustering": clusters_data is not None,
+                "speedup": round(total_photos / max(1, photos_searched), 2) if clusters_data else 1.0
             }
         }
         
@@ -734,7 +784,7 @@ async def compare_faces_folder(
             )
         
         # Procesar fotos desde la carpeta/día
-        return await compare_faces_from_folder(selfie, search_label, photos_in_folder)
+        return await compare_faces_from_folder(selfie, search_label, photos_in_folder, search_day)
         
     except HTTPException:
         raise
