@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import json
 import shutil
-from typing import List
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -123,6 +123,10 @@ clustering_system = EmbeddingsClusteringSystem(
     embeddings_dir=EMBEDDINGS_DIR,
     debug=DEBUG_MODE
 )
+
+# Executor dedicado para tareas pesadas (indexado/embeddings)
+# Importante: 1 worker para evitar saturar CPU/GPU y duplicados.
+INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 print(f"📁 STORAGE_DIR: {STORAGE_DIR}")
 print(f"📁 STORAGE_DIR existe: {STORAGE_DIR.exists()}")
@@ -1403,7 +1407,8 @@ async def delete_folder(folder_name: str = Query(...)):
 async def upload_photos(
     folder_name: str = Query(...),
     photos: List[UploadFile] = File(...),
-    day: str = Query(None)
+    day: str = Query(None),
+    index: bool = Query(True)
 ):
     """
     Sube fotos a una carpeta específica y procesa embeddings automáticamente.
@@ -1448,62 +1453,70 @@ async def upload_photos(
                 if not validate_image_file(photo):
                     errors.append(f"{photo.filename}: Formato no válido")
                     continue
-                
-                # Leer contenido completo del archivo una sola vez
-                contents = await photo.read()
-                photo_size = len(contents)
-                
-                # Validar tamaño
-                if photo_size > MAX_FILE_SIZE:
-                    errors.append(f"{photo.filename}: Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB")
-                    continue
-                
-                # Guardar foto directamente
+
+                # Guardar foto en streaming (más rápido y sin cargar todo en RAM)
                 photo_path = upload_path / photo.filename
                 with open(photo_path, 'wb') as f:
-                    f.write(contents)
+                    total_written = 0
+                    while True:
+                        chunk = await photo.read(1024 * 1024)  # 1MB
+                        if not chunk:
+                            break
+                        total_written += len(chunk)
+                        if total_written > MAX_FILE_SIZE:
+                            try:
+                                f.close()
+                                photo_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB"
+                            )
+                        f.write(chunk)
                 
                 uploaded_photos.append({
                     "filename": photo.filename,
-                    "size": photo_size,
+                    "size": total_written,
                     "status": "success"
                 })
                 uploaded_filenames.append(photo.filename)
                 
-                print(f"✅ Foto guardada: {photo.filename} ({photo_size / 1024:.2f} KB)")
+                print(f"✅ Foto guardada: {photo.filename} ({total_written / 1024:.2f} KB)")
                 
             except HTTPException as e:
                 errors.append(f"{photo.filename}: {e.detail}")
             except Exception as e:
                 errors.append(f"{photo.filename}: {str(e)}")
         
-        # Paso 2: Procesar embeddings automáticamente
+        # Paso 2: Indexado/embeddings (NO bloquear la subida)
+        # Se ejecuta en segundo plano para que la subida sea rápida.
         embeddings_result = None
-        if len(uploaded_photos) > 0:
+        if index and len(uploaded_photos) > 0:
             try:
-                print(f"\n🔄 Procesando embeddings automáticamente...")
-                # OPTIMIZACIÓN: procesamiento incremental (solo fotos nuevas)
-                embeddings_result = clustering_system.process_incremental(
-                    folder_name=folder_name,
-                    day=day,
-                    new_filenames=uploaded_filenames
-                )
-                
-                if embeddings_result["status"] == "success":
-                    print(
-                        f"✅ Procesamiento completado: "
-                        f"{embeddings_result.get('n_clusters')} clusters, "
-                        f"{embeddings_result.get('n_identities')} identidades"
-                    )
-                else:
-                    print(f"⚠️ Advertencia procesando embeddings: {embeddings_result.get('message', 'Error desconocido')}")
-                    
-            except Exception as e:
-                print(f"⚠️ Error procesando embeddings (no crítico): {e}")
+                print(f"\n🧠 Encolando indexado (embeddings + grupos) en segundo plano...")
+
+                def _run_index_job():
+                    try:
+                        clustering_system.process_incremental(
+                            folder_name=folder_name,
+                            day=day,
+                            new_filenames=uploaded_filenames
+                        )
+                    except Exception as e:
+                        print(f"❌ Error en job de indexado: {e}")
+
+                INDEX_EXECUTOR.submit(_run_index_job)
+
                 embeddings_result = {
-                    "status": "error",
-                    "message": str(e)
+                    "status": "queued",
+                    "message": "Indexado encolado en segundo plano",
+                    "new_photos_queued": len(uploaded_filenames),
                 }
+
+            except Exception as e:
+                print(f"⚠️ Error encolando embeddings (no crítico): {e}")
+                embeddings_result = {"status": "error", "message": str(e)}
         
         response = {
             "status": "success",
@@ -1523,7 +1536,8 @@ async def upload_photos(
                 "total_photos_indexed": embeddings_result.get("total_photos"),
                 "new_photos_processed": embeddings_result.get("new_photos_processed"),
                 "failed_new_photos": embeddings_result.get("failed_new_photos"),
-                "processing_time": embeddings_result.get("total_time")
+                "processing_time": embeddings_result.get("total_time"),
+                "new_photos_queued": embeddings_result.get("new_photos_queued"),
             }
         
         return response
@@ -1533,6 +1547,40 @@ async def upload_photos(
     except Exception as e:
         print(f"Error subiendo fotos: {e}")
         raise HTTPException(status_code=500, detail=f"Error subiendo fotos: {str(e)}")
+
+
+@app.post("/indexing/start")
+async def start_indexing(
+    folder_name: str = Query(...),
+    day: str = Query(None),
+):
+    """
+    Encola un re-indexado para una carpeta/día.
+
+    Útil para el panel admin: subir en lotes rápido (index=false) y luego llamar a este endpoint una sola vez.
+    """
+    label = f"{folder_name}/{day}" if day else folder_name
+
+    try:
+        print(f"🧠 Encolando re-indexado completo para {label}...")
+
+        def _run_full_index():
+            try:
+                clustering_system.process_folder(folder_name=folder_name, day=day, force=True)
+            except Exception as e:
+                print(f"❌ Error en re-indexado {label}: {e}")
+
+        INDEX_EXECUTOR.submit(_run_full_index)
+
+        return {
+            "status": "queued",
+            "message": f"Re-indexado encolado para {label}",
+            "folder": folder_name,
+            "day": day,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error encolando indexado: {str(e)}")
 
 @app.get("/photos/list")
 async def list_photos(folder_name: str = Query(...)):
