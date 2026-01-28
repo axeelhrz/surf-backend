@@ -17,3 +17,10 @@ README.md
 .mypy_cache
 .idea
 .vscode
+
+# 🔴 DATOS DE PRODUCCIÓN - NO INCLUIR EN BUILD
+photos_storage/
+embeddings_storage/
+payments_storage/
+*.npy
+*.pkl

@@ -10,7 +10,7 @@ from typing import List, Dict, Tuple, Optional
 import json
 from datetime import datetime
 import insightface
-from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans, DBSCAN
 from sklearn.metrics import silhouette_score
 import warnings
 
@@ -396,6 +396,63 @@ class EmbeddingsClusteringSystem:
             print(f"  - centroids.npy ({clusters_data['centroids'].nbytes / 1024:.2f} KB)")
             print(f"  - labels.npy ({clusters_data['labels'].nbytes / 1024:.2f} KB)")
             print(f"  - metadata.json")
+
+    def save_identity_groups(
+        self,
+        folder_name: str,
+        day: Optional[str],
+        filenames: List[str],
+        identity_labels: np.ndarray,
+        identity_centroids: np.ndarray,
+        identity_stats: List[Dict],
+        source: str,
+        embedding_extraction_time: float,
+        grouping_time: float,
+    ):
+        """
+        Guarda el agrupamiento por identidad (persona) en disco.
+
+        Nota:
+        - identity_labels es por-foto (mismo orden que filenames)
+        - identity_centroids es por-grupo (sin incluir ruido -1)
+        """
+        if day:
+            save_dir = self.embeddings_dir / folder_name / day
+            label = f"{folder_name}/{day}"
+        else:
+            save_dir = self.embeddings_dir / folder_name
+            label = folder_name
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Archivos
+        np.save(save_dir / "identity_labels.npy", identity_labels)
+        np.save(save_dir / "identity_centroids.npy", identity_centroids)
+
+        identity_metadata = {
+            "folder_name": folder_name,
+            "day": day,
+            "created_at": datetime.now().isoformat(),
+            "source": source,  # "full" o "incremental"
+            "filenames": filenames,
+            "n_photos": len(filenames),
+            "n_identities": int(len(identity_stats)),
+            "identity_stats": identity_stats,
+            "embedding_extraction_time": embedding_extraction_time,
+            "grouping_time": grouping_time,
+        }
+
+        with open(save_dir / "identity_metadata.json", "w") as f:
+            json.dump(identity_metadata, f, indent=2)
+
+        if self.debug:
+            print(f"\n{'='*60}")
+            print(f"👥 AGRUPAMIENTO POR IDENTIDAD GUARDADO - {label}")
+            print(f"{'='*60}")
+            print(f"📁 Directorio: {save_dir}")
+            print(f"  - identity_labels.npy")
+            print(f"  - identity_centroids.npy")
+            print(f"  - identity_metadata.json")
     
     def load_clusters(self, folder_name: str, day: Optional[str] = None) -> Optional[Dict]:
         """
@@ -421,6 +478,244 @@ class EmbeddingsClusteringSystem:
         
         if not all([p.exists() for p in [embeddings_path, centroids_path, labels_path, metadata_path]]):
             return None
+
+    def load_identities(self, folder_name: str, day: Optional[str] = None) -> Optional[Dict]:
+        """
+        Carga los grupos por identidad (persona) desde disco.
+        """
+        if day:
+            load_dir = self.embeddings_dir / folder_name / day
+        else:
+            load_dir = self.embeddings_dir / folder_name
+
+        labels_path = load_dir / "identity_labels.npy"
+        centroids_path = load_dir / "identity_centroids.npy"
+        metadata_path = load_dir / "identity_metadata.json"
+
+        if not all([p.exists() for p in [labels_path, centroids_path, metadata_path]]):
+            return None
+
+        try:
+            identity_labels = np.load(labels_path)
+            identity_centroids = np.load(centroids_path)
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+            return {
+                "identity_labels": identity_labels,
+                "identity_centroids": identity_centroids,
+                "filenames": metadata.get("filenames", []),
+                "metadata": metadata,
+            }
+        except Exception as e:
+            if self.debug:
+                print(f"❌ Error cargando identidades: {e}")
+            return None
+
+    def create_identity_groups(
+        self,
+        embeddings: np.ndarray,
+        filenames: List[str],
+        eps_cosine: float = 0.35,
+        min_samples: int = 2,
+    ) -> Dict:
+        """
+        Agrupa embeddings por identidad usando DBSCAN con métrica coseno.
+
+        - eps_cosine: umbral de distancia coseno (menor = más estricto).
+        - min_samples: mínimo de fotos para formar una identidad.
+
+        Retorna:
+        - identity_labels: label por foto (0..k-1) y -1 para ruido
+        - identity_centroids: centroides por identidad (k, dim)
+        - identity_stats: tamaño y % por identidad
+        """
+        n_samples = len(embeddings)
+        if n_samples == 0:
+            raise ValueError("No hay embeddings para agrupar")
+        if n_samples != len(filenames):
+            raise ValueError("embeddings y filenames deben tener la misma longitud")
+
+        if self.debug:
+            print(f"\n{'='*60}")
+            print("👥 CREANDO GRUPOS POR IDENTIDAD (DBSCAN)")
+            print(f"{'='*60}")
+            print(f"Muestras: {n_samples}")
+            print(f"eps_cosine: {eps_cosine}")
+            print(f"min_samples: {min_samples}")
+
+        start_time = datetime.now()
+
+        # DBSCAN con métrica coseno: requiere embeddings normalizados (ya lo están)
+        db = DBSCAN(eps=eps_cosine, min_samples=min_samples, metric="cosine")
+        raw_labels = db.fit_predict(embeddings)
+
+        # Re-mapear labels para que sean consecutivos 0..k-1 (manteniendo -1 como ruido)
+        unique = sorted([l for l in set(raw_labels.tolist()) if l != -1])
+        remap = {old: new for new, old in enumerate(unique)}
+        identity_labels = np.array([remap.get(int(l), -1) for l in raw_labels], dtype=np.int32)
+
+        n_identities = len(unique)
+        identity_centroids = np.zeros((n_identities, embeddings.shape[1]), dtype=np.float32)
+
+        identity_stats: List[Dict] = []
+        for i in range(n_identities):
+            mask = identity_labels == i
+            group_embs = embeddings[mask]
+            centroid = np.mean(group_embs, axis=0)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-10)
+            identity_centroids[i] = centroid.astype(np.float32)
+            size = int(np.sum(mask))
+            identity_stats.append(
+                {"identity_id": int(i), "size": size, "percentage": float(size / n_samples * 100)}
+            )
+
+        noise_count = int(np.sum(identity_labels == -1))
+        total_time = (datetime.now() - start_time).total_seconds()
+
+        if self.debug:
+            print(f"\n✅ Agrupamiento completado")
+            print(f"⏱️  Tiempo: {total_time:.2f} segundos")
+            print(f"👤 Identidades: {n_identities}")
+            print(f"🧩 Ruido (sin grupo): {noise_count}")
+            if n_identities > 0:
+                print("\n📈 Distribución de identidades:")
+                for stat in sorted(identity_stats, key=lambda x: x["size"], reverse=True)[:20]:
+                    print(f"  Persona {stat['identity_id']}: {stat['size']} fotos ({stat['percentage']:.1f}%)")
+
+        return {
+            "identity_labels": identity_labels,
+            "identity_centroids": identity_centroids,
+            "n_identities": n_identities,
+            "noise_count": noise_count,
+            "identity_stats": identity_stats,
+            "processing_time": total_time,
+        }
+
+    def process_incremental(
+        self,
+        folder_name: str,
+        day: Optional[str],
+        new_filenames: List[str],
+        eps_cosine: float = 0.35,
+        min_samples: int = 2,
+    ) -> Dict:
+        """
+        Procesamiento incremental:
+        - extrae embeddings SOLO de nuevas fotos
+        - concatena con embeddings existentes (si hay)
+        - re-agrupa por identidad y guarda índices
+        """
+        label = f"{folder_name}/{day}" if day else folder_name
+
+        # Cargar estado existente si existe
+        existing = self.load_clusters(folder_name, day)
+        if existing is None:
+            # No hay estado previo: procesar carpeta completa (sin force)
+            if self.debug:
+                print(f"ℹ️  No hay estado previo para {label}, procesando carpeta completa")
+            return self.process_folder(folder_name, day, force=True)
+
+        existing_filenames = existing["metadata"].get("filenames", [])
+        existing_embeddings = existing["embeddings"]
+
+        # Filtrar solo filenames realmente nuevos
+        existing_set = set(existing_filenames)
+        filtered_new = [fn for fn in new_filenames if fn not in existing_set]
+
+        if len(filtered_new) == 0:
+            if self.debug:
+                print(f"ℹ️  No hay fotos nuevas para {label} (incremental)")
+            # También intentamos asegurar que identidades existan
+            identities = self.load_identities(folder_name, day)
+            return {
+                "status": "already_up_to_date",
+                "message": f"Sin fotos nuevas para {label}",
+                "total_photos": len(existing_filenames),
+                "successful_embeddings": len(existing_filenames),
+                "failed_embeddings": 0,
+                "n_clusters": existing["metadata"].get("n_clusters"),
+                "n_identities": identities["metadata"]["n_identities"] if identities else None,
+            }
+
+        # Extraer embeddings de nuevas fotos
+        folder_path = self.storage_dir / folder_name
+        search_path = (folder_path / day) if day else folder_path
+
+        if self.debug:
+            print(f"\n🚀 Procesamiento incremental - {label}")
+            print(f"🆕 Nuevas fotos: {len(filtered_new)}")
+
+        start_time = datetime.now()
+        new_embeddings: List[np.ndarray] = []
+        ok_names: List[str] = []
+        failed = 0
+
+        for fn in filtered_new:
+            emb = self._extract_single_embedding(search_path / fn)
+            if emb is None:
+                failed += 1
+                continue
+            new_embeddings.append(emb)
+            ok_names.append(fn)
+
+        embedding_time = (datetime.now() - start_time).total_seconds()
+
+        if len(new_embeddings) == 0:
+            return {
+                "status": "error",
+                "message": f"No se pudo extraer embeddings de las nuevas fotos en {label}",
+                "failed_embeddings": failed,
+            }
+
+        # Concatenar (ojo: existing_embeddings es numpy array)
+        new_embeddings_array = np.array(new_embeddings)
+        merged_embeddings = np.concatenate([existing_embeddings, new_embeddings_array], axis=0)
+        merged_filenames = list(existing_filenames) + list(ok_names)
+
+        # Re-clustering rápido (KMeans) para la optimización actual de búsqueda por clusters
+        clusters_data = self.create_clusters(merged_embeddings)
+
+        # Guardar embeddings + clusters (estado base)
+        embeddings_data = {
+            "embeddings": merged_embeddings,
+            "filenames": merged_filenames,
+            "total_photos": len(merged_filenames),
+            "successful": len(merged_filenames),
+            "failed": failed,
+            "processing_time": embedding_time,
+        }
+        self.save_embeddings_and_clusters(folder_name, embeddings_data, clusters_data, day)
+
+        # Agrupar por identidad (persona) y guardar
+        identity_groups = self.create_identity_groups(
+            merged_embeddings,
+            merged_filenames,
+            eps_cosine=eps_cosine,
+            min_samples=min_samples,
+        )
+        self.save_identity_groups(
+            folder_name=folder_name,
+            day=day,
+            filenames=merged_filenames,
+            identity_labels=identity_groups["identity_labels"],
+            identity_centroids=identity_groups["identity_centroids"],
+            identity_stats=identity_groups["identity_stats"],
+            source="incremental",
+            embedding_extraction_time=embedding_time,
+            grouping_time=identity_groups["processing_time"],
+        )
+
+        return {
+            "status": "success",
+            "message": f"Incremental completado para {label}",
+            "total_photos": len(merged_filenames),
+            "new_photos_processed": len(ok_names),
+            "failed_new_photos": failed,
+            "n_clusters": clusters_data["n_clusters"],
+            "n_identities": identity_groups["n_identities"],
+            "total_time": float(embedding_time + clusters_data["processing_time"] + identity_groups["processing_time"]),
+        }
         
         try:
             # Cargar datos
@@ -479,6 +774,12 @@ class EmbeddingsClusteringSystem:
             
             # Paso 2: Crear clusters
             clusters_data = self.create_clusters(embeddings_data["embeddings"])
+
+            # Paso 2b: Crear identidades (persona)
+            identity_groups = self.create_identity_groups(
+                embeddings_data["embeddings"],
+                embeddings_data["filenames"],
+            )
             
             # Paso 3: Guardar todo
             self.save_embeddings_and_clusters(
@@ -486,6 +787,18 @@ class EmbeddingsClusteringSystem:
                 embeddings_data, 
                 clusters_data,
                 day
+            )
+
+            self.save_identity_groups(
+                folder_name=folder_name,
+                day=day,
+                filenames=embeddings_data["filenames"],
+                identity_labels=identity_groups["identity_labels"],
+                identity_centroids=identity_groups["identity_centroids"],
+                identity_stats=identity_groups["identity_stats"],
+                source="full",
+                embedding_extraction_time=embeddings_data["processing_time"],
+                grouping_time=identity_groups["processing_time"],
             )
             
             return {
@@ -495,8 +808,9 @@ class EmbeddingsClusteringSystem:
                 "successful_embeddings": embeddings_data["successful"],
                 "failed_embeddings": embeddings_data["failed"],
                 "n_clusters": clusters_data["n_clusters"],
+                "n_identities": identity_groups["n_identities"],
                 "silhouette_score": clusters_data["silhouette_score"],
-                "total_time": embeddings_data["processing_time"] + clusters_data["processing_time"]
+                "total_time": embeddings_data["processing_time"] + clusters_data["processing_time"] + identity_groups["processing_time"]
             }
             
         except Exception as e:

@@ -105,12 +105,17 @@ except Exception as e:
 
 # Obtener el directorio base del script
 BASE_DIR = Path(__file__).parent.absolute()
-STORAGE_DIR = BASE_DIR / "photos_storage"
-EMBEDDINGS_DIR = BASE_DIR / "embeddings_storage"
+
+# Usar variables de entorno para las rutas de almacenamiento
+# En Railway, estas apuntarán a los volumes montados
+# En local, usará las carpetas por defecto
+import os
+STORAGE_DIR = Path(os.getenv("STORAGE_DIR", str(BASE_DIR / "photos_storage")))
+EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", str(BASE_DIR / "embeddings_storage")))
 
 # Crear directorios si no existen
-STORAGE_DIR.mkdir(exist_ok=True)
-EMBEDDINGS_DIR.mkdir(exist_ok=True)
+STORAGE_DIR.mkdir(exist_ok=True, parents=True)
+EMBEDDINGS_DIR.mkdir(exist_ok=True, parents=True)
 
 # Inicializar sistema de clustering
 clustering_system = EmbeddingsClusteringSystem(
@@ -444,11 +449,18 @@ def extract_face_embedding(image: np.ndarray):
         print(f"Error extrayendo embedding: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando imagen: {str(e)}")
 
-async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos_in_folder: List[Path], search_day: str = None):
+async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search_label: str, photos_in_folder: List[Path], search_day: str = None):
     """
     Compara un selfie con fotos de una carpeta específica usando clustering optimizado.
     
     OPTIMIZACIÓN: Si existen clusters pre-calculados, busca solo en los clusters más relevantes.
+    
+    Args:
+        selfie: Archivo de selfie
+        folder_name: Nombre real de la carpeta (ej: "SANTA SURF PROCENTER")
+        search_label: Label para mostrar (ej: "SANTA SURF PROCENTER/2026-01-22")
+        photos_in_folder: Lista de rutas de fotos
+        search_day: Día específico (opcional)
     """
     try:
         # Validar que el selfie sea una imagen
@@ -474,44 +486,79 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         if DEBUG_MODE:
             print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
         
-        # OPTIMIZACIÓN: Intentar cargar clusters pre-calculados
-        clusters_data = clustering_system.load_clusters(folder_name, search_day)
-        
-        if clusters_data is not None:
-            # ✅ BÚSQUEDA OPTIMIZADA CON CLUSTERS
+        # OPTIMIZACIÓN 1 (preferida): Identidades (grupos/persona) pre-calculadas
+        identities_data = clustering_system.load_identities(folder_name, search_day)
+        clusters_data = None
+
+        if identities_data is not None:
             if DEBUG_MODE:
-                print(f"🎯 Usando búsqueda optimizada con clusters")
-                print(f"📊 Clusters disponibles: {clusters_data['metadata']['n_clusters']}")
-            
-            # Encontrar clusters más relevantes
-            relevant_clusters = clustering_system.find_relevant_clusters(
+                print(f"🎯 Usando búsqueda optimizada por identidades (persona)")
+                print(f"👤 Identidades disponibles: {identities_data['metadata'].get('n_identities')}")
+
+            # Encontrar identidades más relevantes (comparando contra centroides)
+            relevant_identities = clustering_system.find_relevant_clusters(
                 selfie_embedding,
-                clusters_data['centroids'],
-                top_k=3  # Buscar en los 3 clusters más similares
+                identities_data["identity_centroids"],
+                top_k=3
             )
-            
-            # Obtener fotos solo de los clusters relevantes
+
             photos_to_search = []
-            for cluster_id in relevant_clusters:
-                # Obtener índices de fotos en este cluster
-                cluster_mask = clusters_data['labels'] == cluster_id
-                cluster_filenames = [clusters_data['filenames'][i] for i, mask in enumerate(cluster_mask) if mask]
-                
-                # Agregar rutas completas
-                for filename in cluster_filenames:
+            for identity_id in relevant_identities:
+                identity_mask = identities_data["identity_labels"] == identity_id
+                identity_filenames = [
+                    identities_data["filenames"][i] for i, mask in enumerate(identity_mask) if mask
+                ]
+
+                for filename in identity_filenames:
                     photo_path = photos_in_folder[0].parent / filename
                     if photo_path.exists():
                         photos_to_search.append(photo_path)
-            
+
             if DEBUG_MODE:
-                print(f"🔍 Buscando en {len(photos_to_search)} fotos de {len(photos_in_folder)} totales ({len(photos_to_search)/len(photos_in_folder)*100:.1f}%)")
+                print(
+                    f"🔍 Buscando en {len(photos_to_search)} fotos de {len(photos_in_folder)} "
+                    f"totales ({len(photos_to_search)/len(photos_in_folder)*100:.1f}%)"
+                )
                 print(f"⚡ Aceleración estimada: {len(photos_in_folder)/max(1, len(photos_to_search)):.1f}x")
+
         else:
-            # ⚠️ BÚSQUEDA TRADICIONAL (sin clusters)
-            if DEBUG_MODE:
-                print(f"⚠️ No hay clusters pre-calculados, usando búsqueda tradicional")
-                print(f"💡 Tip: Los embeddings se procesarán automáticamente al subir fotos")
-            photos_to_search = photos_in_folder
+            # OPTIMIZACIÓN 2 (fallback): clusters genéricos
+            clusters_data = clustering_system.load_clusters(folder_name, search_day)
+
+            if clusters_data is not None:
+                if DEBUG_MODE:
+                    print(f"🎯 Usando búsqueda optimizada con clusters")
+                    print(f"📊 Clusters disponibles: {clusters_data['metadata']['n_clusters']}")
+
+                relevant_clusters = clustering_system.find_relevant_clusters(
+                    selfie_embedding,
+                    clusters_data["centroids"],
+                    top_k=3
+                )
+
+                photos_to_search = []
+                for cluster_id in relevant_clusters:
+                    cluster_mask = clusters_data["labels"] == cluster_id
+                    cluster_filenames = [
+                        clusters_data["filenames"][i] for i, mask in enumerate(cluster_mask) if mask
+                    ]
+
+                    for filename in cluster_filenames:
+                        photo_path = photos_in_folder[0].parent / filename
+                        if photo_path.exists():
+                            photos_to_search.append(photo_path)
+
+                if DEBUG_MODE:
+                    print(
+                        f"🔍 Buscando en {len(photos_to_search)} fotos de {len(photos_in_folder)} "
+                        f"totales ({len(photos_to_search)/len(photos_in_folder)*100:.1f}%)"
+                    )
+                    print(f"⚡ Aceleración estimada: {len(photos_in_folder)/max(1, len(photos_to_search)):.1f}x")
+            else:
+                if DEBUG_MODE:
+                    print(f"⚠️ No hay índices pre-calculados, usando búsqueda tradicional")
+                    print(f"💡 Tip: Los embeddings se procesarán automáticamente al subir fotos")
+                photos_to_search = photos_in_folder
         
         if DEBUG_MODE:
             print(f"🚀 Procesando {len(photos_to_search)} fotos en paralelo con {MAX_WORKERS} workers...")
@@ -580,7 +627,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         # Imprimir resumen en consola
         if DEBUG_MODE:
             print("\n" + "="*60)
-            print(f"📋 RESUMEN DE BÚSQUEDA - {folder_name}")
+            print(f"📋 RESUMEN DE BÚSQUEDA - {search_label}")
             print("="*60)
             if clusters_data:
                 print(f"🎯 Búsqueda optimizada con clusters")
@@ -602,7 +649,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
         return {
             "status": "success",
             "selfie": selfie.filename,
-            "folder": folder_name,
+            "folder": search_label,
             "matches": matches_sorted,
             "non_matches": non_matches,
             "statistics": {
@@ -615,8 +662,9 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, photos
                 "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2),
                 "processing_time_seconds": round(total_time, 2),
                 "photos_per_second": round(photos_searched / total_time, 2) if total_time > 0 else 0,
-                "used_clustering": clusters_data is not None,
-                "speedup": round(total_photos / max(1, photos_searched), 2) if clusters_data else 1.0
+            "used_identity_groups": identities_data is not None,
+            "used_clustering": clusters_data is not None,
+            "speedup": round(total_photos / max(1, photos_searched), 2) if (identities_data or clusters_data) else 1.0
             }
         }
         
@@ -783,8 +831,8 @@ async def compare_faces_folder(
                 detail=f"No hay fotos en '{search_label}'"
             )
         
-        # Procesar fotos desde la carpeta/día
-        return await compare_faces_from_folder(selfie, search_label, photos_in_folder, search_day)
+        # Procesar fotos desde la carpeta/día - PASAR search_folder (no search_label)
+        return await compare_faces_from_folder(selfie, search_folder, search_label, photos_in_folder, search_day)
         
     except HTTPException:
         raise
@@ -1387,6 +1435,7 @@ async def upload_photos(
         
         uploaded_photos = []
         errors = []
+        uploaded_filenames: List[str] = []
         
         # Paso 1: Subir fotos
         print(f"\n{'='*60}")
@@ -1419,6 +1468,7 @@ async def upload_photos(
                     "size": photo_size,
                     "status": "success"
                 })
+                uploaded_filenames.append(photo.filename)
                 
                 print(f"✅ Foto guardada: {photo.filename} ({photo_size / 1024:.2f} KB)")
                 
@@ -1432,14 +1482,19 @@ async def upload_photos(
         if len(uploaded_photos) > 0:
             try:
                 print(f"\n🔄 Procesando embeddings automáticamente...")
-                embeddings_result = clustering_system.process_folder(
+                # OPTIMIZACIÓN: procesamiento incremental (solo fotos nuevas)
+                embeddings_result = clustering_system.process_incremental(
                     folder_name=folder_name,
                     day=day,
-                    force=True  # Forzar re-procesamiento para incluir nuevas fotos
+                    new_filenames=uploaded_filenames
                 )
                 
                 if embeddings_result["status"] == "success":
-                    print(f"✅ Embeddings procesados: {embeddings_result['n_clusters']} clusters creados")
+                    print(
+                        f"✅ Procesamiento completado: "
+                        f"{embeddings_result.get('n_clusters')} clusters, "
+                        f"{embeddings_result.get('n_identities')} identidades"
+                    )
                 else:
                     print(f"⚠️ Advertencia procesando embeddings: {embeddings_result.get('message', 'Error desconocido')}")
                     
@@ -1464,7 +1519,10 @@ async def upload_photos(
                 "status": embeddings_result["status"],
                 "message": embeddings_result.get("message", ""),
                 "n_clusters": embeddings_result.get("n_clusters"),
-                "successful_embeddings": embeddings_result.get("successful_embeddings"),
+                "n_identities": embeddings_result.get("n_identities"),
+                "total_photos_indexed": embeddings_result.get("total_photos"),
+                "new_photos_processed": embeddings_result.get("new_photos_processed"),
+                "failed_new_photos": embeddings_result.get("failed_new_photos"),
                 "processing_time": embeddings_result.get("total_time")
             }
         
