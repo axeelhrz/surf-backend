@@ -626,58 +626,89 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
                     print(f"💡 Tip: Los embeddings se procesarán automáticamente al subir fotos")
                 photos_to_search = photos_in_folder
         
-        if DEBUG_MODE:
-            print(f"🚀 Procesando {len(photos_to_search)} fotos en paralelo con {MAX_WORKERS} workers...")
-        
-        # Procesar fotos en paralelo
         matches = []
         non_matches = []
         errors = 0
-        
         start_time = datetime.now()
-        
-        # Usar ThreadPoolExecutor para procesamiento paralelo
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Enviar todas las tareas al pool
-            future_to_photo = {
-                executor.submit(process_single_photo, photo_path, selfie_embedding): photo_path
-                for photo_path in photos_to_search
-            }
-            
-            # Procesar resultados a medida que se completan
-            completed = 0
-            for future in as_completed(future_to_photo):
-                completed += 1
-                
-                # Mostrar progreso cada 10 fotos
-                if DEBUG_MODE and completed % 10 == 0:
-                    elapsed = (datetime.now() - start_time).total_seconds()
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    print(f"⏳ Progreso: {completed}/{len(photos_to_search)} fotos ({rate:.1f} fotos/seg)")
-                
-                try:
-                    result = future.result()
-                    
-                    if result.get("error"):
+        photos_searched = len(photos_to_search)
+
+        # Ruta rápida: comparar en memoria con embeddings ya guardados (sin leer fotos ni InsightFace por foto)
+        use_fast_path = False
+        embeddings_fast = None
+        filenames_fast = None
+        indices_to_compare = []
+
+        if identities_data is not None:
+            emb_data = clustering_system.load_embeddings(folder_name, search_day)
+            if emb_data is not None and len(emb_data["filenames"]) == len(identities_data["identity_labels"]):
+                indices_to_compare = [
+                    i for i in range(len(identities_data["identity_labels"]))
+                    if identities_data["identity_labels"][i] in relevant_identities
+                ]
+                if indices_to_compare:
+                    embeddings_fast = emb_data["embeddings"]
+                    filenames_fast = emb_data["filenames"]
+                    use_fast_path = True
+                    if DEBUG_MODE:
+                        print(f"⚡ Búsqueda en memoria: {len(indices_to_compare)} fotos (identidades)")
+        elif clusters_data is not None:
+            indices_to_compare = [
+                i for i in range(len(clusters_data["labels"]))
+                if clusters_data["labels"][i] in relevant_clusters
+            ]
+            if indices_to_compare:
+                embeddings_fast = clusters_data["embeddings"]
+                filenames_fast = clusters_data["filenames"]
+                use_fast_path = True
+                if DEBUG_MODE:
+                    print(f"⚡ Búsqueda en memoria: {len(indices_to_compare)} fotos (clusters)")
+
+        if use_fast_path and embeddings_fast is not None and filenames_fast is not None:
+            for i in indices_to_compare:
+                similarity, distance = calculate_similarity(selfie_embedding, embeddings_fast[i])
+                if distance <= SIMILARITY_THRESHOLD:
+                    matches.append({"file": filenames_fast[i], "similarity": similarity})
+                else:
+                    min_pct = (1 - SIMILARITY_THRESHOLD) * 100
+                    non_matches.append({
+                        "file": filenames_fast[i],
+                        "similarity": similarity,
+                        "reason": f"Similitud {similarity:.2f}% por debajo del umbral {min_pct:.2f}%"
+                    })
+            photos_searched = len(indices_to_compare)
+        else:
+            # Ruta lenta: leer cada foto y extraer embedding (solo cuando no hay índices)
+            if DEBUG_MODE:
+                print(f"🚀 Procesando {len(photos_to_search)} fotos en paralelo con {MAX_WORKERS} workers...")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_photo = {
+                    executor.submit(process_single_photo, photo_path, selfie_embedding): photo_path
+                    for photo_path in photos_to_search
+                }
+                completed = 0
+                for future in as_completed(future_to_photo):
+                    completed += 1
+                    if DEBUG_MODE and completed % 10 == 0:
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        print(f"⏳ Progreso: {completed}/{len(photos_to_search)} fotos ({rate:.1f} fotos/seg)")
+                    try:
+                        result = future.result()
+                        if result.get("error"):
+                            errors += 1
+                        elif result["is_match"]:
+                            matches.append({"file": result["file"], "similarity": result["similarity"]})
+                        else:
+                            non_matches.append({
+                                "file": result["file"],
+                                "similarity": result["similarity"],
+                                "reason": result.get("reason", "No coincide")
+                            })
+                    except Exception as e:
+                        photo_path = future_to_photo[future]
+                        print(f"❌ Error procesando resultado de {photo_path.name}: {e}")
                         errors += 1
-                    elif result["is_match"]:
-                        matches.append({
-                            "file": result["file"],
-                            "similarity": result["similarity"]
-                        })
-                    else:
-                        non_matches.append({
-                            "file": result["file"],
-                            "similarity": result["similarity"],
-                            "reason": result.get("reason", "No coincide")
-                        })
-                        
-                except Exception as e:
-                    photo_path = future_to_photo[future]
-                    print(f"❌ Error procesando resultado de {photo_path.name}: {e}")
-                    errors += 1
-        
-        # Calcular tiempo total
+
         total_time = (datetime.now() - start_time).total_seconds()
         
         # Calcular estadísticas
@@ -695,8 +726,11 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
             print("\n" + "="*60)
             print(f"📋 RESUMEN DE BÚSQUEDA - {search_label}")
             print("="*60)
+            if identities_data:
+                print(f"🎯 Búsqueda por identidades (persona)")
             if clusters_data:
                 print(f"🎯 Búsqueda optimizada con clusters")
+            if identities_data or clusters_data:
                 print(f"📊 Fotos analizadas: {photos_searched}/{total_photos} ({photos_searched/total_photos*100:.1f}%)")
             print(f"⏱️  Tiempo total: {total_time:.2f} segundos")
             print(f"⚡ Velocidad: {photos_searched / total_time:.1f} fotos/segundo")

@@ -479,6 +479,52 @@ class EmbeddingsClusteringSystem:
         if not all([p.exists() for p in [embeddings_path, centroids_path, labels_path, metadata_path]]):
             return None
 
+        try:
+            embeddings = np.load(embeddings_path)
+            centroids = np.load(centroids_path)
+            labels = np.load(labels_path)
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+            return {
+                "embeddings": embeddings,
+                "centroids": centroids,
+                "labels": labels,
+                "filenames": metadata.get("filenames", []),
+                "metadata": metadata,
+            }
+        except Exception as e:
+            if self.debug:
+                print(f"❌ Error cargando clusters: {e}")
+            return None
+
+    def load_embeddings(self, folder_name: str, day: Optional[str] = None) -> Optional[Dict]:
+        """
+        Carga solo embeddings y filenames (mismo orden que identity_labels).
+        Usado para búsqueda rápida en memoria cuando ya tenemos identidades.
+        """
+        if day:
+            load_dir = self.embeddings_dir / folder_name / day
+        else:
+            load_dir = self.embeddings_dir / folder_name
+        embeddings_path = load_dir / "embeddings.npy"
+        metadata_path = load_dir / "metadata.json"
+        if not embeddings_path.exists():
+            return None
+        try:
+            embeddings = np.load(embeddings_path)
+            filenames = []
+            if metadata_path.exists():
+                with open(metadata_path, "r") as f:
+                    meta = json.load(f)
+                filenames = meta.get("filenames", [])
+            if len(filenames) != len(embeddings):
+                return None
+            return {"embeddings": embeddings, "filenames": filenames}
+        except Exception as e:
+            if self.debug:
+                print(f"❌ Error cargando embeddings: {e}")
+            return None
+
     def load_identities(self, folder_name: str, day: Optional[str] = None) -> Optional[Dict]:
         """
         Carga los grupos por identidad (persona) desde disco.
