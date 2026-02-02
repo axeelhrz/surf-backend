@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 import cv2
 import numpy as np
 import insightface
@@ -8,11 +8,14 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import json
 import shutil
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
+import asyncio
+import queue
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
+import threading
 from stripe_endpoints import router as stripe_router
 from admin_endpoints import router as admin_router
 from embeddings_clustering import EmbeddingsClusteringSystem
@@ -515,7 +518,14 @@ def extract_face_embedding(image: np.ndarray, is_selfie: bool = False):
         print(f"Error extrayendo embedding: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando imagen: {str(e)}")
 
-async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search_label: str, photos_in_folder: List[Path], search_day: str = None):
+async def compare_faces_from_folder(
+    selfie: UploadFile,
+    folder_name: str,
+    search_label: str,
+    photos_in_folder: List[Path],
+    search_day: str = None,
+    on_event: Optional[Callable[[dict], None]] = None,
+):
     """
     Compara un selfie con fotos de una carpeta específica usando clustering optimizado.
     
@@ -527,6 +537,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
         search_label: Label para mostrar (ej: "SANTA SURF PROCENTER/2026-01-22")
         photos_in_folder: Lista de rutas de fotos
         search_day: Día específico (opcional)
+        on_event: Si se proporciona, se llama por cada match y al final con type "done" (para streaming).
     """
     try:
         # Validar que el selfie sea una imagen
@@ -668,7 +679,10 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
             for i in indices_to_compare:
                 similarity, distance = calculate_similarity(selfie_embedding, embeddings_fast[i])
                 if distance <= SIMILARITY_THRESHOLD:
-                    matches.append({"file": filenames_fast[i], "similarity": similarity})
+                    m = {"file": filenames_fast[i], "similarity": similarity}
+                    matches.append(m)
+                    if on_event:
+                        on_event({"type": "match", "file": m["file"], "similarity": m["similarity"]})
                 else:
                     min_pct = (1 - SIMILARITY_THRESHOLD) * 100
                     non_matches.append({
@@ -698,7 +712,10 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
                         if result.get("error"):
                             errors += 1
                         elif result["is_match"]:
-                            matches.append({"file": result["file"], "similarity": result["similarity"]})
+                            m = {"file": result["file"], "similarity": result["similarity"]}
+                            matches.append(m)
+                            if on_event:
+                                on_event({"type": "match", "file": m["file"], "similarity": m["similarity"]})
                         else:
                             non_matches.append({
                                 "file": result["file"],
@@ -747,7 +764,7 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
             print(f"📊 Porcentaje de coincidencia: {match_percentage:.2f}%")
             print("="*60 + "\n")
         
-        return {
+        payload = {
             "status": "success",
             "selfie": selfie.filename,
             "folder": search_label,
@@ -763,11 +780,14 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
                 "threshold_used": round((1 - SIMILARITY_THRESHOLD) * 100, 2),
                 "processing_time_seconds": round(total_time, 2),
                 "photos_per_second": round(photos_searched / total_time, 2) if total_time > 0 else 0,
-            "used_identity_groups": identities_data is not None,
-            "used_clustering": clusters_data is not None,
-            "speedup": round(total_photos / max(1, photos_searched), 2) if (identities_data or clusters_data) else 1.0
+                "used_identity_groups": identities_data is not None,
+                "used_clustering": clusters_data is not None,
+                "speedup": round(total_photos / max(1, photos_searched), 2) if (identities_data or clusters_data) else 1.0
             }
         }
+        if on_event:
+            on_event({"type": "done", **payload})
+        return payload
         
     except HTTPException:
         raise
@@ -887,11 +907,68 @@ def process_single_photo(photo_path: Path, selfie_embedding: np.ndarray) -> dict
             "error": True
         }
 
+class _BytesUploadAdapter:
+    """Wrapper para usar bytes ya leídos como UploadFile en otro hilo."""
+    def __init__(self, filename: str, body: bytes):
+        self.filename = filename
+        self._body = body
+    async def read(self):
+        return self._body
+
+
+def _run_compare_with_queue(selfie, search_folder, search_label, photos_in_folder, search_day, q: queue.Queue):
+    """Ejecuta compare_faces_from_folder y envía eventos a la cola (para streaming)."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        def on_event(ev: dict):
+            q.put(ev)
+
+        loop.run_until_complete(
+            compare_faces_from_folder(
+                selfie, search_folder, search_label, photos_in_folder, search_day, on_event=on_event
+            )
+        )
+    except Exception as e:
+        q.put({"type": "error", "detail": str(e)})
+    finally:
+        loop.close()
+
+
+async def _stream_compare_events(selfie, search_folder, search_label, photos_in_folder, search_day):
+    """Generador async que lee eventos de la cola y emite líneas NDJSON."""
+    q = queue.Queue()
+    loop = asyncio.get_event_loop()
+    thread = threading.Thread(
+        target=_run_compare_with_queue,
+        args=(selfie, search_folder, search_label, photos_in_folder, search_day, q),
+    )
+    thread.start()
+    while True:
+        try:
+            event = await loop.run_in_executor(None, lambda: q.get(timeout=0.5))
+        except queue.Empty:
+            await asyncio.sleep(0.05)
+            if not thread.is_alive() and q.empty():
+                break
+            continue
+        if event.get("type") == "error":
+            yield json.dumps({"status": "error", "detail": event.get("detail", "Unknown error")}) + "\n"
+            break
+        line = json.dumps(event, default=float) + "\n"
+        yield line
+        if event.get("type") == "done":
+            break
+    thread.join(timeout=1)
+
+
 @app.post("/compare-faces-folder")
 async def compare_faces_folder(
     selfie: UploadFile = File(...),
     search_folder: str = Query(...),
-    search_day: str = Query(None)
+    search_day: str = Query(None),
+    stream: bool = Query(False, description="Si true, devuelve NDJSON por streaming (matches al instante)"),
 ):
     """
     Busca un selfie en una carpeta específica y opcionalmente en un día específico
@@ -899,6 +976,7 @@ async def compare_faces_folder(
     - **selfie**: Imagen del rostro a comparar
     - **search_folder**: Nombre de la carpeta para buscar (ej: 'Surf')
     - **search_day**: (Opcional) Día específico para buscar (ej: '2026-01-13')
+    - **stream**: Si true, respuesta en NDJSON por streaming (cada match llega al instante)
     """
     try:
         folder_path = STORAGE_DIR / search_folder
@@ -930,6 +1008,16 @@ async def compare_faces_folder(
             raise HTTPException(
                 status_code=400,
                 detail=f"No hay fotos en '{search_label}'"
+            )
+        
+        if stream:
+            # Leer selfie una vez en el hilo principal (UploadFile no es seguro entre hilos)
+            body = await selfie.read()
+            selfie_for_thread = _BytesUploadAdapter(selfie.filename, body)
+            return StreamingResponse(
+                _stream_compare_events(selfie_for_thread, search_folder, search_label, photos_in_folder, search_day),
+                media_type="application/x-ndjson",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
         
         # Procesar fotos desde la carpeta/día - PASAR search_folder (no search_label)
