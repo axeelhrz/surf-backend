@@ -43,10 +43,9 @@ app.include_router(admin_router)
 # 0.4 = balance (recomendado para la mayoría de casos)
 # 0.35 = más estricto
 # 0.5 = más flexible
-# 0.56 = muy flexible (detecta variaciones significativas)
-# Configuración optimizada para máxima precisión
-# Umbral: 0.56 = 44% similitud mínima (muy sensible para detectar variaciones)
-SIMILARITY_THRESHOLD = 0.56  # Distancia coseno (mayor = más permisivo)
+# 0.56 = 44% similitud mínima
+# 0.62 = 38% similitud mínima (más permisivo para detectar más matches)
+SIMILARITY_THRESHOLD = 0.62  # Distancia coseno (mayor = más permisivo). 38% similitud mínima.
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_FACE_SIZE = 20  # Tamaño mínimo del rostro en píxeles (reducido)
 MIN_FACE_CONFIDENCE = 0.3  # Confianza mínima del detector (reducida)
