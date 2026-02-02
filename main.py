@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 import cv2
@@ -623,7 +623,8 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
             else:
                 if DEBUG_MODE:
                     print(f"⚠️ No hay índices pre-calculados, usando búsqueda tradicional")
-                    print(f"💡 Tip: Los embeddings se procesarán automáticamente al subir fotos")
+                    print(f"💡 Para búsqueda rápida: ejecuta indexado después de subir fotos")
+                    print(f"   POST /indexing/start?folder_name={folder_name}&day={search_day or ''}")
                 photos_to_search = photos_in_folder
         
         matches = []
@@ -1678,31 +1679,60 @@ async def upload_photos(
 async def start_indexing(
     folder_name: str = Query(...),
     day: str = Query(None),
+    body: Optional[dict] = Body(None),
 ):
     """
-    Encola un re-indexado para una carpeta/día.
+    Encola el indexado (embeddings + grupos por persona) para una carpeta/día.
 
-    Útil para el panel admin: subir en lotes rápido (index=false) y luego llamar a este endpoint una sola vez.
+    - Si envías body con "new_filenames": ["a.jpg", "b.jpg", ...] → indexado incremental (solo esas fotos, rápido).
+    - Si no envías body → re-indexado completo de toda la carpeta (lento, muchas fotos).
     """
     label = f"{folder_name}/{day}" if day else folder_name
+    new_filenames = (body or {}).get("new_filenames") if isinstance(body, dict) else None
 
     try:
-        print(f"🧠 Encolando re-indexado completo para {label}...")
+        if new_filenames and len(new_filenames) > 0:
+            # Incremental: solo fotos nuevas → rápido, agrupa por persona sin reprocesar todo
+            print(f"🧠 Encolando indexado incremental para {label} ({len(new_filenames)} fotos nuevas)...")
+            filenames_list = list(new_filenames)[:10000]  # límite razonable
 
-        def _run_full_index():
-            try:
-                clustering_system.process_folder(folder_name=folder_name, day=day, force=True)
-            except Exception as e:
-                print(f"❌ Error en re-indexado {label}: {e}")
+            def _run_incremental():
+                try:
+                    clustering_system.process_incremental(
+                        folder_name=folder_name,
+                        day=day,
+                        new_filenames=filenames_list,
+                    )
+                except Exception as e:
+                    print(f"❌ Error en indexado incremental {label}: {e}")
 
-        INDEX_EXECUTOR.submit(_run_full_index)
+            INDEX_EXECUTOR.submit(_run_incremental)
+            return {
+                "status": "queued",
+                "message": f"Indexado incremental encolado para {label} ({len(filenames_list)} fotos)",
+                "folder": folder_name,
+                "day": day,
+                "incremental": True,
+                "new_filenames_count": len(filenames_list),
+            }
+        else:
+            # Completo: toda la carpeta (por si no hay estado previo o se quiere forzar)
+            print(f"🧠 Encolando re-indexado completo para {label}...")
 
-        return {
-            "status": "queued",
-            "message": f"Re-indexado encolado para {label}",
-            "folder": folder_name,
-            "day": day,
-        }
+            def _run_full_index():
+                try:
+                    clustering_system.process_folder(folder_name=folder_name, day=day, force=True)
+                except Exception as e:
+                    print(f"❌ Error en re-indexado {label}: {e}")
+
+            INDEX_EXECUTOR.submit(_run_full_index)
+            return {
+                "status": "queued",
+                "message": f"Re-indexado completo encolado para {label}",
+                "folder": folder_name,
+                "day": day,
+                "incremental": False,
+            }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error encolando indexado: {str(e)}")
@@ -1754,10 +1784,8 @@ async def get_photo_preview(
         else:
             photo_path = folder_path / filename
         
-        print(f"🔍 Buscando foto: {photo_path}")
-        print(f"🔍 Path existe: {photo_path.exists()}")
-        print(f"🔍 Path absoluto: {photo_path.absolute()}")
-        
+        if DEBUG_MODE:
+            print(f"🔍 Buscando foto: {photo_path}")
         if not photo_path.exists():
             raise HTTPException(status_code=404, detail=f"La foto no existe: {photo_path}")
         

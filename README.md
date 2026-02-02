@@ -124,6 +124,27 @@ docker run -p 8000:8000 surf-backend
 
 La aplicación estará disponible en la URL proporcionada por Railway.
 
+### Volúmenes y búsqueda rápida
+
+Por defecto, las fotos y los índices (embeddings/identidades) se guardan en el sistema de archivos del contenedor, que **se borra en cada deploy o reinicio**. Por eso la búsqueda puede salir como "No hay índices pre-calculados" y tardar mucho (754 fotos una a una).
+
+**Para que la búsqueda sea rápida y persistente:**
+
+1. **Añadir un volumen en Railway**  
+   En tu proyecto: **Variables** → **Volumes** → crea un volumen y monta la ruta, por ejemplo `/data`.
+
+2. **Variables de entorno** (en el servicio):  
+   - `STORAGE_DIR=/data/photos_storage`  
+   - `EMBEDDINGS_DIR=/data/embeddings_storage`  
+
+   Así las fotos y los índices se guardan en el volumen y sobreviven a reinicios y deploys.
+
+3. **Indexado después de subir fotos**  
+   Tras subir fotos a una carpeta/día, el indexado se encola en segundo plano. Si quieres forzar el indexado para una carpeta concreta (o si no tienes volumen y quieres que al menos esa sesión sea rápida):  
+   `POST /indexing/start?folder_name=Lanzarote&day=2026-02-02`  
+   (sustituye `Lanzarote` y `2026-02-02` por tu carpeta y día).  
+   Desde el panel admin también puedes usar "Procesar embeddings" si existe esa opción.
+
 ## 📊 Estructura del Código
 
 ```
