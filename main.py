@@ -1580,35 +1580,26 @@ async def upload_photos(
                     errors.append(f"{photo.filename}: Formato no válido")
                     continue
 
-                # Guardar foto en streaming (más rápido y sin cargar todo en RAM)
+                # Una lectura por foto (más rápido que chunks) y escribir
+                contents = await photo.read()
+                if len(contents) > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB"
+                    )
                 photo_path = upload_path / photo.filename
                 with open(photo_path, 'wb') as f:
-                    total_written = 0
-                    while True:
-                        chunk = await photo.read(1024 * 1024)  # 1MB
-                        if not chunk:
-                            break
-                        total_written += len(chunk)
-                        if total_written > MAX_FILE_SIZE:
-                            try:
-                                f.close()
-                                photo_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024}MB"
-                            )
-                        f.write(chunk)
+                    f.write(contents)
                 
                 uploaded_photos.append({
                     "filename": photo.filename,
-                    "size": total_written,
+                    "size": len(contents),
                     "status": "success"
                 })
                 uploaded_filenames.append(photo.filename)
                 
-                print(f"✅ Foto guardada: {photo.filename} ({total_written / 1024:.2f} KB)")
+                if DEBUG_MODE:
+                    print(f"✅ Foto guardada: {photo.filename} ({len(contents) / 1024:.2f} KB)")
                 
             except HTTPException as e:
                 errors.append(f"{photo.filename}: {e.detail}")
