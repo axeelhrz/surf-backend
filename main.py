@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 import cv2
 import numpy as np
 import insightface
@@ -1114,6 +1114,30 @@ async def get_folders():
     """Lista todas las carpetas disponibles (alias de /folders/list)"""
     return await list_folders()
 
+
+@app.get("/folders/public")
+async def list_folders_public():
+    """
+    Lista carpetas para la web pública: solo nombre y si tiene portada.
+    Muy rápido: no lee metadata.json ni cuenta fotos. Incluye Cache-Control.
+    """
+    try:
+        storage_path = STORAGE_DIR
+        folders = []
+        for folder in storage_path.iterdir():
+            if folder.is_dir() and not folder.name.startswith("."):
+                cover_path = folder / "cover.jpg"
+                cover_image = "cover.jpg" if cover_path.exists() else None
+                folders.append({"name": folder.name, "cover_image": cover_image})
+        return JSONResponse(
+            content={"status": "success", "folders": folders},
+            headers={"Cache-Control": "public, max-age=60"},
+        )
+    except Exception as e:
+        print(f"Error listando carpetas públicas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/folders/create")
 async def create_folder(folder_name: str = Query(...)):
     """Crea una nueva carpeta para almacenar fotos"""
@@ -1256,8 +1280,11 @@ async def get_folder_cover(folder_name: str):
         elif cover_path.suffix.lower() == '.gif':
             content_type = "image/gif"
         
-        return Response(content=content, media_type=content_type)
-        
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
     except HTTPException:
         raise
     except Exception as e:
