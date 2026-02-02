@@ -407,12 +407,70 @@ def detect_face(image: np.ndarray, is_selfie: bool = False) -> bool:
         print(f"❌ Error detectando rostro: {e}")
         return False
 
-def extract_face_embedding(image: np.ndarray):
+def _get_faces_or_fallback(image: np.ndarray, is_selfie: bool):
     """
-    Extrae el embedding facial usando InsightFace de manera optimizada.
+    Obtiene rostros con InsightFace; si es selfie y no hay rostros, prueba imagen mejorada y escalas.
+    Devuelve (imagen_que_funcionó, lista_faces) o (None, []) si no hay rostros.
+    """
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
+    faces = face_analysis.get(image)
+    if len(faces) > 0:
+        return image, faces
+
+    if not is_selfie:
+        return None, []
+
+    # MÉTODO 2: Imagen mejorada (CLAHE)
+    try:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        enhanced = cv2.merge([l, a, b])
+        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        faces = face_analysis.get(enhanced)
+        if len(faces) > 0:
+            if DEBUG_MODE:
+                print("  📍 Rostro detectado en imagen mejorada (CLAHE)")
+            return enhanced, faces
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"  ⚠️ Fallback CLAHE: {e}")
+
+    # MÉTODO 3: Múltiples escalas
+    height, width = image.shape[:2]
+    for scale in [0.5, 0.75, 1.5, 2.0]:
+        try:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+            faces = face_analysis.get(resized)
+            if len(faces) > 0:
+                if DEBUG_MODE:
+                    print(f"  📍 Rostro detectado en escala {scale}x")
+                return resized, faces
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"  ⚠️ Escala {scale}: {e}")
+
+    return None, []
+
+
+def extract_face_embedding(image: np.ndarray, is_selfie: bool = False):
+    """
+    Extrae el embedding facial usando InsightFace.
+    
+    Si is_selfie=True y no se detecta rostro en la imagen original, prueba con imagen mejorada
+    (contraste) y con varias escalas, igual que detect_face, para evitar falsos "no rostro"
+    en selfies que sí tienen rostro visible.
     
     Args:
         image: Imagen en formato numpy array (BGR)
+        is_selfie: Si True, usa los mismos fallbacks que detect_face (mejorar imagen, escalas)
     
     Returns:
         tuple: (embedding, face_object) - Embedding normalizado y objeto face con atributos
@@ -427,13 +485,16 @@ def extract_face_embedding(image: np.ndarray):
         elif image.shape[2] == 4:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
         
-        # Detectar rostros con InsightFace
-        faces = face_analysis.get(image)
+        # Obtener rostros (con fallbacks si es selfie)
+        img_to_use, faces = _get_faces_or_fallback(image, is_selfie)
         
         if len(faces) == 0:
-            raise ValueError("No se detectó ningún rostro en la imagen")
+            raise HTTPException(
+                status_code=400,
+                detail="No se detectó ningún rostro en la imagen"
+            )
         
-        # Seleccionar el rostro con mayor confianza (más simple y directo)
+        # Seleccionar el rostro con mayor confianza
         best_face = max(faces, key=lambda f: f.det_score)
         
         if DEBUG_MODE:
@@ -441,7 +502,7 @@ def extract_face_embedding(image: np.ndarray):
             face_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
             print(f"  📍 Rostro detectado: tamaño={face_size}px, confianza={best_face.det_score:.3f}")
         
-        # Obtener embedding normalizado de InsightFace
+        # Obtener embedding normalizado de InsightFace (usar img_to_use por si vino de fallback)
         embedding = best_face.normed_embedding
         
         # Asegurar normalización
@@ -449,6 +510,8 @@ def extract_face_embedding(image: np.ndarray):
         
         return np.array(embedding), best_face
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error extrayendo embedding: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando imagen: {str(e)}")
@@ -484,8 +547,8 @@ async def compare_faces_from_folder(selfie: UploadFile, folder_name: str, search
                 detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
             )
         
-        # Extraer embedding del selfie
-        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        # Extraer embedding del selfie (con fallbacks para selfies que a veces fallan en imagen original)
+        selfie_embedding, _ = extract_face_embedding(selfie_array, is_selfie=True)
         
         if DEBUG_MODE:
             print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
@@ -883,8 +946,8 @@ async def compare_faces(
                 detail="No se detectó un rostro en el selfie. Por favor, asegúrate de que la imagen contenga un rostro visible."
             )
         
-        # Extraer embedding del selfie
-        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        # Extraer embedding del selfie (con fallbacks para selfies)
+        selfie_embedding, _ = extract_face_embedding(selfie_array, is_selfie=True)
         
         if DEBUG_MODE:
             print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
@@ -1356,8 +1419,10 @@ async def get_folder_days(folder_name: str):
                 # Verificar si es una fecha válida
                 try:
                     datetime.fromisoformat(item.name)
-                    # Contar fotos en el día
-                    photo_count = len([f for f in item.iterdir() if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}])
+                    # Contar fotos en el día (excluyendo cover.jpg)
+                    photo_count = len([f for f in item.iterdir()
+                                       if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+                                       and not f.name.startswith('cover')])
                     days.append({
                         "date": item.name,
                         "photo_count": photo_count
@@ -1857,8 +1922,8 @@ async def search_similar(selfie: UploadFile = File(...)):
                 detail="No se detectó un rostro en el selfie"
             )
         
-        # Extraer embedding del selfie
-        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        # Extraer embedding del selfie (con fallbacks para selfies)
+        selfie_embedding, _ = extract_face_embedding(selfie_array, is_selfie=True)
         
         # Buscar fotos similares en TODAS las carpetas
         matches = []
@@ -2045,8 +2110,8 @@ async def marketplace_search_similar(selfie: UploadFile = File(...)):
                 detail="No se detectó un rostro en el selfie"
             )
         
-        # Extraer embedding del selfie
-        selfie_embedding, _ = extract_face_embedding(selfie_array)
+        # Extraer embedding del selfie (con fallbacks para selfies)
+        selfie_embedding, _ = extract_face_embedding(selfie_array, is_selfie=True)
         
         if DEBUG_MODE:
             print(f"🔍 Selfie embedding extraído: shape={selfie_embedding.shape}, norm={np.linalg.norm(selfie_embedding):.4f}")
