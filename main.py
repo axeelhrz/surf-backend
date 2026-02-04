@@ -1290,6 +1290,20 @@ async def set_folder_display_metadata(body: dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/folders/display-metadata")
+async def delete_folder_display_metadata(folder_name: str = Query(...)):
+    """Quita la metadata de visualización de una carpeta (la quita de la lista en admin si es virtual)."""
+    try:
+        data = _load_folder_display_metadata()
+        if folder_name not in data:
+            return {"status": "success", "message": "No había metadata para esta carpeta"}
+        del data[folder_name]
+        _save_folder_display_metadata(data)
+        return {"status": "success", "message": f"Metadata de '{folder_name}' eliminada"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/folders/public")
 async def list_folders_public():
     """
