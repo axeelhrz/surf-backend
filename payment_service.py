@@ -6,12 +6,12 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from payment_models import PhotoItem, PaymentRecord
 from stripe_config import (
-    STRIPE_SECRET_KEY, 
+    STRIPE_SECRET_KEY,
     STRIPE_PUBLISHABLE_KEY,
-    FRONTEND_URL, 
+    FRONTEND_URL,
     BACKEND_URL,
     PHOTO_PRICE_CENTS,
-    TAX_RATE
+    TAX_RATE,
 )
 
 # Directorio para almacenar registros de pagos (env para persistencia en Railway)
@@ -79,6 +79,13 @@ class PaymentService:
                     "total": str(total),
                 }
             )
+            
+            # Guardar sesión pendiente para la página de éxito (descargas)
+            PaymentService._save_pending_session(session.id, {
+                "items": [item.dict() for item in items],
+                "customer_email": customer_email,
+                "customer_name": customer_name,
+            })
             
             return {
                 "session_id": session.id,
@@ -266,6 +273,115 @@ class PaymentService:
         except Exception as e:
             print(f"❌ Error obteniendo pago: {e}")
             return None
+    
+    @staticmethod
+    def _pending_sessions_path() -> Path:
+        return PAYMENTS_DIR / "pending_sessions.json"
+    
+    @staticmethod
+    def _save_pending_session(session_id: str, data: Dict) -> None:
+        try:
+            path = PaymentService._pending_sessions_path()
+            sessions = {}
+            if path.exists():
+                with open(path, 'r') as f:
+                    sessions = json.load(f)
+            sessions[session_id] = data
+            with open(path, 'w') as f:
+                json.dump(sessions, f, indent=2)
+        except Exception as e:
+            print(f"❌ Error guardando sesión pendiente: {e}")
+    
+    @staticmethod
+    def _load_pending_session(session_id: str) -> Optional[Dict]:
+        try:
+            path = PaymentService._pending_sessions_path()
+            if not path.exists():
+                return None
+            with open(path, 'r') as f:
+                sessions = json.load(f)
+            return sessions.get(session_id)
+        except Exception as e:
+            print(f"❌ Error cargando sesión pendiente: {e}")
+            return None
+    
+    @staticmethod
+    def _remove_pending_session(session_id: str) -> None:
+        try:
+            path = PaymentService._pending_sessions_path()
+            if not path.exists():
+                return
+            with open(path, 'r') as f:
+                sessions = json.load(f)
+            sessions.pop(session_id, None)
+            with open(path, 'w') as f:
+                json.dump(sessions, f, indent=2)
+        except Exception as e:
+            print(f"❌ Error eliminando sesión pendiente: {e}")
+    
+    @staticmethod
+    def get_success_details(session_id: str) -> Optional[Dict]:
+        """
+        Obtiene los detalles del pago tras el redirect de éxito.
+        Verifica que el pago esté completado, crea el registro de pago y devuelve los items para descarga.
+        """
+        try:
+            if not STRIPE_SECRET_KEY:
+                return None
+            session = stripe.checkout.Session.retrieve(session_id)
+            if session.payment_status != "paid":
+                return None
+            pending = PaymentService._load_pending_session(session_id)
+            if not pending:
+                # Ya confirmado antes: buscar pago existente por stripe_session_id
+                payments = PaymentService.get_all_payments()
+                for p in payments:
+                    if p.get("stripe_session_id") == session_id:
+                        return {"payment": p, "items": p.get("items", [])}
+                return None
+            items_data = pending.get("items", [])
+            items = [PhotoItem(**it) for it in items_data]
+            payment_record = {
+                "id": f"PAY_{datetime.now().timestamp()}",
+                "stripe_session_id": session_id,
+                "stripe_payment_intent_id": session.payment_intent,
+                "customer_email": pending.get("customer_email", session.customer_email or ""),
+                "customer_name": pending.get("customer_name", ""),
+                "amount": session.amount_total / 100 if session.amount_total else 0,
+                "currency": session.currency or "usd",
+                "status": "completed",
+                "items_count": len(items),
+                "items": items_data,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            }
+            PaymentService.save_payment_record(payment_record)
+            PaymentService._remove_pending_session(session_id)
+            return {"payment": payment_record, "items": items_data}
+        except Exception as e:
+            print(f"❌ Error get_success_details: {e}")
+            return None
+    
+    @staticmethod
+    def get_test_success_details() -> Dict:
+        """Devuelve datos de prueba para la página de descargas (sin pago real)."""
+        return {
+            "payment": {
+                "id": "TEST_001",
+                "customer_email": "cliente@ejemplo.com",
+                "customer_name": "Cliente de prueba",
+                "amount": 35,
+                "currency": "eur",
+                "status": "completed",
+                "items_count": 2,
+                "created_at": datetime.now().isoformat(),
+            },
+            "items": [
+                {"id": "1", "filename": "foto1.jpg", "school": "LA CABRA SURF SCHOOL", "date": "2025-02-01", "price": 35, "thumbnail": None},
+                {"id": "2", "filename": "foto2.jpg", "school": "LA CABRA SURF SCHOOL", "date": "2025-02-01", "price": 15, "thumbnail": None},
+            ],
+            "backend_url": BACKEND_URL,
+        }
     
     @staticmethod
     def get_stripe_publishable_key() -> str:

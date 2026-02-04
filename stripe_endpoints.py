@@ -163,3 +163,30 @@ async def get_payment(payment_id: str):
     except Exception as e:
         print(f"❌ Error obteniendo pago: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@router.get("/success-details")
+async def get_success_details(session_id: str = None, test: str = None):
+    """
+    Tras el pago, devuelve el pago y los items para la página de descargas.
+    - session_id: ID de la sesión de Stripe (redirect de éxito).
+    - test=1: devuelve datos de prueba para ver la sección de descargas sin pago real.
+    """
+    try:
+        if test == "1":
+            data = PaymentService.get_test_success_details()
+            return {"status": "success", **data}
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id o test=1 requerido")
+        data = PaymentService.get_success_details(session_id)
+        if not data:
+            raise HTTPException(
+                status_code=404,
+                detail="Pago no encontrado o no completado"
+            )
+        return {"status": "success", **data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error success-details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

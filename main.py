@@ -11,6 +11,7 @@ import shutil
 from typing import List, Optional, Dict, Any, Callable
 import asyncio
 import queue
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -151,6 +152,89 @@ INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 print(f"📁 STORAGE_DIR: {STORAGE_DIR}")
 print(f"📁 STORAGE_DIR existe: {STORAGE_DIR.exists()}")
 print(f"📁 EMBEDDINGS_DIR: {EMBEDDINGS_DIR}")
+
+# Extensiones de imagen para borrado automático (solo fotos, no metadata/cover)
+PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+AUTO_DELETE_DAYS = int(os.getenv("AUTO_DELETE_PHOTOS_DAYS", "90"))
+
+def cleanup_photos_older_than_days(storage_dir: Path = STORAGE_DIR, days: int = None) -> dict:
+    """
+    Elimina fotos con más de `days` días desde su subida (por fecha de modificación del archivo).
+    Recorre carpetas de escuelas y subcarpetas de días. No borra metadata.json, cover.* ni embeddings.
+    """
+    if days is None:
+        days = AUTO_DELETE_DAYS
+    cutoff = datetime.now().timestamp() - (days * 24 * 3600)
+    deleted_count = 0
+    deleted_paths = []
+    try:
+        if not storage_dir.exists():
+            return {"deleted_count": 0, "deleted_paths": [], "error": "STORAGE_DIR no existe"}
+        for school_dir in storage_dir.iterdir():
+            if not school_dir.is_dir():
+                continue
+            # Archivos directamente en la carpeta de la escuela
+            for f in list(school_dir.iterdir()):
+                if f.is_file() and f.suffix.lower() in PHOTO_EXTENSIONS:
+                    if f.stat().st_mtime < cutoff:
+                        try:
+                            f.unlink()
+                            deleted_count += 1
+                            deleted_paths.append(str(f.relative_to(storage_dir)))
+                        except Exception as e:
+                            print(f"⚠️ No se pudo borrar {f}: {e}")
+                elif f.is_dir():
+                    # Subcarpeta de día (YYYY-MM-DD)
+                    for day_file in list(f.iterdir()):
+                        if day_file.is_file() and day_file.suffix.lower() in PHOTO_EXTENSIONS:
+                            if day_file.stat().st_mtime < cutoff:
+                                try:
+                                    day_file.unlink()
+                                    deleted_count += 1
+                                    deleted_paths.append(str(day_file.relative_to(storage_dir)))
+                                except Exception as e:
+                                    print(f"⚠️ No se pudo borrar {day_file}: {e}")
+                    # Eliminar carpeta del día si quedó vacía (solo si no hay más archivos)
+                    try:
+                        if not any(f.iterdir()):
+                            f.rmdir()
+                    except Exception:
+                        pass
+        print(f"🧹 Borrado automático: {deleted_count} foto(s) con más de {days} días")
+        return {"deleted_count": deleted_count, "deleted_paths": deleted_paths}
+    except Exception as e:
+        print(f"❌ Error en borrado automático: {e}")
+        return {"deleted_count": deleted_count, "deleted_paths": deleted_paths, "error": str(e)}
+
+
+def _cleanup_photos_scheduler():
+    """Ejecuta el borrado de fotos > 90 días cada 24 horas."""
+    while True:
+        try:
+            time.sleep(60)  # Esperar 1 minuto al arranque antes del primer chequeo
+            cleanup_photos_older_than_days()
+        except Exception as e:
+            print(f"❌ Error en programación de borrado automático: {e}")
+        time.sleep(24 * 3600)  # 24 horas
+
+
+@app.on_event("startup")
+def startup_cleanup_scheduler():
+    """Arranca el hilo que borra fotos con más de 90 días cada 24h."""
+    t = threading.Thread(target=_cleanup_photos_scheduler, daemon=True)
+    t.start()
+    print(f"🧹 Borrado automático de fotos activado: se eliminarán fotos con más de {AUTO_DELETE_DAYS} días cada 24h.")
+
+
+@app.post("/cleanup-old-photos")
+async def api_cleanup_old_photos(days: int = Query(AUTO_DELETE_DAYS, ge=1, le=365)):
+    """
+    Ejecuta el borrado de fotos con más de N días desde su subida (por defecto 90).
+    Útil para ejecutar manualmente o desde un cron externo.
+    """
+    result = cleanup_photos_older_than_days(days=days)
+    return {"status": "success", **result}
+
 
 @app.get("/health")
 async def health_check():

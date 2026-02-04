@@ -149,6 +149,13 @@ Por defecto, las fotos y los índices (embeddings/identidades) se guardan en el 
 
 Las fotos que se muestran **antes de comprar** (preview) llevan la marca de agua definida en `static/MarcaAgua.png`. La imagen original está en el frontend en `frontend/img/MarcaAgua.png`. Si cambias esa imagen, copia el nuevo PNG a `backend/static/MarcaAgua.png` y redeploya el backend para que se use en las previsualizaciones.
 
+### Borrado automático de fotos (90 días)
+
+Las fotos se **borran automáticamente** a los **90 días** desde su subida (según la fecha de modificación del archivo). Al arrancar el backend se inicia un hilo que ejecuta la limpieza cada 24 horas. Solo se eliminan archivos de imagen (jpg, png, etc.); no se tocan `metadata.json`, `cover.*` ni carpetas de embeddings.
+
+- **Variable opcional:** `AUTO_DELETE_PHOTOS_DAYS=90` (por defecto 90). Puedes cambiarla en `.env` o en Railway.
+- **Ejecución manual:** `POST /cleanup-old-photos?days=90` para lanzar la limpieza a mano o desde un cron externo.
+
 ## 📊 Estructura del Código
 
 ```
