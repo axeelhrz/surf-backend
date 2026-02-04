@@ -2116,18 +2116,17 @@ async def get_photo_preview(
             if watermark_path.exists():
                 try:
                     wm_img = Image.open(watermark_path).convert("RGBA")
-                    # Tamaño de cada baldosa: ~25% del ancho para cubrir toda la foto en mosaico
-                    tile_width = max(int(width * 0.25), 80)
+                    # Tamaño de cada baldosa: ~45% del ancho para que se vea grande y legible
+                    tile_width = max(int(width * 0.45), 120)
                     ratio = tile_width / wm_img.width
                     tile_height = int(wm_img.height * ratio)
                     wm_resized = wm_img.resize((tile_width, tile_height), Image.Resampling.LANCZOS)
                     alpha = wm_resized.split()[3]
-                    # Repetir la marca de agua en mosaico para cubrir toda la imagen
-                    step_x = max(tile_width // 2, 1)  # solapamiento para cobertura total
-                    step_y = max(tile_height // 2, 1)
+                    # Paso ~85% del tamaño: cubre toda la foto pero sin amontonar (más separados)
+                    step_x = max(int(tile_width * 0.85), 1)
+                    step_y = max(int(tile_height * 0.85), 1)
                     for y in range(-tile_height, height + tile_height, step_y):
                         for x in range(-tile_width, width + tile_width, step_x):
-                            box = (x, y, x + tile_width, y + tile_height)
                             watermarked.paste(wm_resized, (x, y), alpha)
                     output_image = watermarked
                 except Exception as e:
