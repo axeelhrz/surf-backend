@@ -1846,6 +1846,63 @@ async def list_photos(folder_name: str = Query(...)):
         print(f"Error listando fotos: {e}")
         raise HTTPException(status_code=500, detail=f"Error listando fotos: {str(e)}")
 
+def _apply_text_watermark(watermarked: Image.Image, width: int, height: int) -> Image.Image:
+    """Aplica marca de agua de texto (fallback si no existe MarcaAgua.png)."""
+    draw = ImageDraw.Draw(watermarked)
+    watermark_text = "SURFSHOT"
+    font_size = max(width, height) // 15
+    font = None
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+    except Exception:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+    try:
+        if hasattr(draw, 'textbbox'):
+            bbox = draw.textbbox((0, 0), watermark_text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        else:
+            text_width, text_height = draw.textsize(watermark_text, font=font)
+    except Exception:
+        text_width = len(watermark_text) * font_size // 2
+        text_height = font_size
+    x = (width - text_width) // 2
+    y = (height - text_height) // 2
+    shadow_offset = 2
+    draw.text((x + shadow_offset, y + shadow_offset), watermark_text, fill=(0, 0, 0), font=font)
+    draw.text((x, y), watermark_text, fill=(255, 255, 255), font=font)
+    corner_text = "PREVIEW"
+    corner_font_size = max(width, height) // 25
+    try:
+        corner_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", corner_font_size)
+    except Exception:
+        try:
+            corner_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", corner_font_size)
+        except Exception:
+            corner_font = ImageFont.load_default()
+    try:
+        if hasattr(draw, 'textbbox'):
+            corner_bbox = draw.textbbox((0, 0), corner_text, font=corner_font)
+            corner_text_width = corner_bbox[2] - corner_bbox[0]
+            corner_text_height = corner_bbox[3] - corner_bbox[1]
+        else:
+            corner_text_width, corner_text_height = draw.textsize(corner_text, font=corner_font)
+    except Exception:
+        corner_text_width = len(corner_text) * corner_font_size // 2
+        corner_text_height = corner_font_size
+    corner_x = width - corner_text_width - 20
+    corner_y = height - corner_text_height - 20
+    draw.rectangle(
+        [corner_x - 10, corner_y - 5, corner_x + corner_text_width + 10, corner_y + corner_text_height + 5],
+        fill=(0, 0, 0),
+    )
+    draw.text((corner_x, corner_y), corner_text, fill=(255, 255, 255), font=corner_font)
+    return watermarked
+
+
 @app.get("/photos/preview")
 async def get_photo_preview(
     folder_name: str = Query(...),
@@ -1853,7 +1910,7 @@ async def get_photo_preview(
     watermark: bool = Query(True),
     day: str = Query(None)
 ):
-    """Obtiene una foto con marca de agua para previsualización"""
+    """Obtiene una foto con marca de agua para previsualización (imagen MarcaAgua.png o texto)"""
     try:
         folder_path = STORAGE_DIR / folder_name
         
@@ -1871,95 +1928,38 @@ async def get_photo_preview(
         # Leer la imagen
         image = Image.open(photo_path)
         
-        # Agregar marca de agua si se solicita
+        # Agregar marca de agua si se solicita (imagen MarcaAgua.png o fallback a texto)
         if watermark:
-            # Convertir a RGB primero para simplificar
+            # Convertir a RGB para trabajar
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-            
-            # Crear una copia para trabajar
             watermarked = image.copy()
-            draw = ImageDraw.Draw(watermarked)
-            
-            # Texto de la marca de agua
-            watermark_text = "SURFSHOT"
-            
-            # Obtener dimensiones de la imagen
             width, height = watermarked.size
-            
-            # Intentar cargar una fuente, si no está disponible usar la predeterminada
-            font_size = max(width, height) // 15
-            font = None
-            try:
-                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-            except:
+
+            # Ruta de la imagen de marca de agua (frontend/img/MarcaAgua.png copiada a backend/static)
+            watermark_path = BASE_DIR / "static" / "MarcaAgua.png"
+            if watermark_path.exists():
                 try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-                except:
-                    font = ImageFont.load_default()
-            
-            # Obtener dimensiones del texto (método compatible)
-            try:
-                # PIL 10.0.0+ usa textbbox
-                if hasattr(draw, 'textbbox'):
-                    bbox = draw.textbbox((0, 0), watermark_text, font=font)
-                    text_width = bbox[2] - bbox[0]
-                    text_height = bbox[3] - bbox[1]
-                else:
-                    # Versiones antiguas de PIL usan textsize
-                    text_width, text_height = draw.textsize(watermark_text, font=font)
-            except Exception as e:
-                # Fallback: estimar tamaño del texto
-                text_width = len(watermark_text) * font_size // 2
-                text_height = font_size
-            
-            # Calcular posición (centro de la imagen)
-            x = (width - text_width) // 2
-            y = (height - text_height) // 2
-            
-            # Dibujar sombra del texto (para mejor visibilidad)
-            shadow_offset = 2
-            draw.text((x + shadow_offset, y + shadow_offset), watermark_text, 
-                     fill=(0, 0, 0), font=font)
-            
-            # Dibujar el texto principal (blanco)
-            draw.text((x, y), watermark_text, 
-                     fill=(255, 255, 255), font=font)
-            
-            # Agregar marca de agua adicional en la esquina inferior derecha
-            corner_text = "PREVIEW"
-            corner_font_size = max(width, height) // 25
-            corner_font = None
-            try:
-                corner_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", corner_font_size)
-            except:
-                try:
-                    corner_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", corner_font_size)
-                except:
-                    corner_font = ImageFont.load_default()
-            
-            try:
-                if hasattr(draw, 'textbbox'):
-                    corner_bbox = draw.textbbox((0, 0), corner_text, font=corner_font)
-                    corner_text_width = corner_bbox[2] - corner_bbox[0]
-                    corner_text_height = corner_bbox[3] - corner_bbox[1]
-                else:
-                    corner_text_width, corner_text_height = draw.textsize(corner_text, font=corner_font)
-            except Exception as e:
-                corner_text_width = len(corner_text) * corner_font_size // 2
-                corner_text_height = corner_font_size
-            
-            corner_x = width - corner_text_width - 20
-            corner_y = height - corner_text_height - 20
-            
-            # Fondo semi-transparente para el texto de la esquina (usando RGB con alpha simulado)
-            draw.rectangle([corner_x - 10, corner_y - 5, corner_x + corner_text_width + 10, corner_y + corner_text_height + 5],
-                          fill=(0, 0, 0))
-            
-            draw.text((corner_x, corner_y), corner_text, 
-                     fill=(255, 255, 255), font=corner_font)
-            
-            output_image = watermarked
+                    wm_img = Image.open(watermark_path).convert("RGBA")
+                    # Tamaño: ~40% del ancho de la foto, manteniendo proporción
+                    wm_max_width = int(width * 0.4)
+                    ratio = wm_max_width / wm_img.width
+                    wm_new_h = int(wm_img.height * ratio)
+                    wm_resized = wm_img.resize((wm_max_width, wm_new_h), Image.Resampling.LANCZOS)
+                    # Centrar la marca de agua
+                    x = (width - wm_resized.width) // 2
+                    y = (height - wm_resized.height) // 2
+                    # Pegar con transparencia: la foto es RGB, usamos el canal alpha del PNG como máscara
+                    watermarked.paste(wm_resized, (x, y), wm_resized.split()[3])
+                    output_image = watermarked
+                except Exception as e:
+                    if DEBUG_MODE:
+                        print(f"⚠️ Marca de agua por imagen falló ({e}), usando texto")
+                    output_image = _apply_text_watermark(watermarked, width, height)
+            else:
+                if DEBUG_MODE:
+                    print(f"⚠️ No encontrado {watermark_path}, usando marca de agua por texto")
+                output_image = _apply_text_watermark(watermarked, width, height)
         else:
             # Convertir a RGB si es necesario para JPEG
             if image.mode != 'RGB':

@@ -145,11 +145,17 @@ Por defecto, las fotos y los índices (embeddings/identidades) se guardan en el 
    (sustituye `Lanzarote` y `2026-02-02` por tu carpeta y día).  
    Desde el panel admin también puedes usar "Procesar embeddings" si existe esa opción.
 
+### Marca de agua en previsualización
+
+Las fotos que se muestran **antes de comprar** (preview) llevan la marca de agua definida en `static/MarcaAgua.png`. La imagen original está en el frontend en `frontend/img/MarcaAgua.png`. Si cambias esa imagen, copia el nuevo PNG a `backend/static/MarcaAgua.png` y redeploya el backend para que se use en las previsualizaciones.
+
 ## 📊 Estructura del Código
 
 ```
 backend/
 ├── main.py              # Aplicación principal
+├── static/
+│   └── MarcaAgua.png   # Marca de agua para fotos de previsualización
 ├── requirements.txt     # Dependencias
 ├── Procfile            # Configuración para Railway
 ├── runtime.txt         # Versión de Python
