@@ -119,6 +119,24 @@ EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", str(BASE_DIR / "embeddings_sto
 STORAGE_DIR.mkdir(exist_ok=True, parents=True)
 EMBEDDINGS_DIR.mkdir(exist_ok=True, parents=True)
 
+# Metadata de visualización por carpeta (fecha y texto personalizado; p. ej. OTRAS ESCUELAS)
+FOLDER_DISPLAY_METADATA_PATH = BASE_DIR / "folder_display_metadata.json"
+
+def _load_folder_display_metadata() -> dict:
+    """Carga fecha y texto por carpeta (para mostrar en frontend)."""
+    if not FOLDER_DISPLAY_METADATA_PATH.exists():
+        return {}
+    try:
+        with open(FOLDER_DISPLAY_METADATA_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_folder_display_metadata(data: dict) -> None:
+    """Guarda metadata de visualización por carpeta."""
+    with open(FOLDER_DISPLAY_METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 # Inicializar sistema de clustering
 clustering_system = EmbeddingsClusteringSystem(
     storage_dir=STORAGE_DIR,
@@ -1191,11 +1209,12 @@ async def compare_faces(
 
 @app.get("/folders/list")
 async def list_folders():
-    """Lista todas las carpetas disponibles"""
+    """Lista todas las carpetas disponibles (incluye custom_date y custom_text)."""
     try:
         storage_path = STORAGE_DIR
+        display_meta = _load_folder_display_metadata()
         folders = []
-        
+
         for folder in storage_path.iterdir():
             if folder.is_dir():
                 metadata_path = folder / "metadata.json"
@@ -1203,27 +1222,29 @@ async def list_folders():
                 if metadata_path.exists():
                     with open(metadata_path, 'r') as f:
                         metadata = json.load(f)
-                
+
                 # Contar fotos (excluyendo cover.jpg)
-                photo_count = len([f for f in folder.iterdir() 
-                                  if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'} 
+                photo_count = len([f for f in folder.iterdir()
+                                  if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}
                                   and not f.name.startswith('cover')])
-                
+
                 # Verificar si existe portada
                 cover_image = metadata.get("cover_image")
                 if not cover_image:
-                    # Buscar archivo de portada físicamente
                     cover_path = folder / "cover.jpg"
                     if cover_path.exists():
                         cover_image = "cover.jpg"
-                
+
+                meta = display_meta.get(folder.name, {})
                 folders.append({
                     "name": folder.name,
                     "created_at": metadata.get("created_at", datetime.now().isoformat()),
                     "photo_count": photo_count,
-                    "cover_image": cover_image
+                    "cover_image": cover_image,
+                    "custom_date": meta.get("date", ""),
+                    "custom_text": meta.get("text", ""),
                 })
-        
+
         return {
             "status": "success",
             "folders": sorted(folders, key=lambda x: x["created_at"], reverse=True)
@@ -1238,20 +1259,58 @@ async def get_folders():
     return await list_folders()
 
 
+@app.get("/folders/display-metadata")
+async def get_folder_display_metadata():
+    """Devuelve fecha y texto personalizados por carpeta (para admin y frontend)."""
+    try:
+        data = _load_folder_display_metadata()
+        return {"status": "success", "metadata": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/folders/display-metadata")
+async def set_folder_display_metadata(body: dict = Body(...)):
+    """Guarda fecha y/o texto para una carpeta (incluye OTRAS ESCUELAS aunque no exista en disco)."""
+    try:
+        folder_name = (body.get("folder_name") or "").strip()
+        if not folder_name:
+            raise HTTPException(status_code=400, detail="folder_name es obligatorio")
+        data = _load_folder_display_metadata()
+        entry = data.setdefault(folder_name, {})
+        if "date" in body:
+            entry["date"] = str(body["date"]).strip() if body["date"] else ""
+        if "text" in body:
+            entry["text"] = str(body["text"]).strip() if body["text"] else ""
+        _save_folder_display_metadata(data)
+        return {"status": "success", "folder_name": folder_name, "metadata": entry}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/folders/public")
 async def list_folders_public():
     """
-    Lista carpetas para la web pública: solo nombre y si tiene portada.
-    Muy rápido: no lee metadata.json ni cuenta fotos. Incluye Cache-Control.
+    Lista carpetas para la web pública: nombre, portada y metadata de visualización (fecha, texto).
+    Incluye Cache-Control.
     """
     try:
         storage_path = STORAGE_DIR
+        display_meta = _load_folder_display_metadata()
         folders = []
         for folder in storage_path.iterdir():
             if folder.is_dir() and not folder.name.startswith("."):
                 cover_path = folder / "cover.jpg"
                 cover_image = "cover.jpg" if cover_path.exists() else None
-                folders.append({"name": folder.name, "cover_image": cover_image})
+                meta = display_meta.get(folder.name, {})
+                folders.append({
+                    "name": folder.name,
+                    "cover_image": cover_image,
+                    "custom_date": meta.get("date", ""),
+                    "custom_text": meta.get("text", ""),
+                })
         return JSONResponse(
             content={"status": "success", "folders": folders},
             headers={"Cache-Control": "public, max-age=60"},
