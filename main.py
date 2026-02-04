@@ -123,6 +123,23 @@ EMBEDDINGS_DIR.mkdir(exist_ok=True, parents=True)
 # Metadata de visualización por carpeta (fecha y texto personalizado; p. ej. OTRAS ESCUELAS)
 FOLDER_DISPLAY_METADATA_PATH = BASE_DIR / "folder_display_metadata.json"
 
+
+def _resolve_folder_path(storage_dir: Path, folder_name: str) -> Optional[Path]:
+    """
+    Resuelve el nombre de carpeta de forma insensible a mayúsculas/minúsculas.
+    En Linux (Railway) las carpetas son case-sensitive; el frontend puede enviar
+    "SANTA SURF PROCENTER" y en disco estar "Santa Surf Procenter".
+    """
+    direct = storage_dir / folder_name
+    if direct.exists() and direct.is_dir():
+        return direct
+    name_lower = folder_name.lower()
+    for p in storage_dir.iterdir():
+        if p.is_dir() and p.name.lower() == name_lower:
+            return p
+    return None
+
+
 def _load_folder_display_metadata() -> dict:
     """Carga fecha y texto por carpeta (para mostrar en frontend)."""
     if not FOLDER_DISPLAY_METADATA_PATH.exists():
@@ -1081,13 +1098,13 @@ async def compare_faces_folder(
     - **stream**: Si true, respuesta en NDJSON por streaming (cada match llega al instante)
     """
     try:
-        folder_path = STORAGE_DIR / search_folder
-        
-        if not folder_path.exists():
+        folder_path = _resolve_folder_path(STORAGE_DIR, search_folder)
+        if folder_path is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"La carpeta '{search_folder}' no existe"
             )
+        search_folder = folder_path.name  # nombre real en disco para el resto del flujo
         
         # Si se especifica un día, buscar en la subcarpeta del día
         if search_day:
@@ -1529,11 +1546,10 @@ async def set_folder_cover(
 
 @app.get("/folders/cover/{folder_name}")
 async def get_folder_cover(folder_name: str):
-    """Obtiene la imagen de portada de una carpeta"""
+    """Obtiene la imagen de portada de una carpeta (nombre insensible a mayúsculas)"""
     try:
-        folder_path = STORAGE_DIR / folder_name
-        
-        if not folder_path.exists():
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
             raise HTTPException(status_code=404, detail="La carpeta no existe")
         
         # Buscar archivo de portada
@@ -1612,9 +1628,11 @@ async def set_day_cover(
 
 @app.get("/folders/{folder_name}/day-cover/{day_date}")
 async def get_day_cover(folder_name: str, day_date: str):
-    """Obtiene la imagen de portada de un día específico"""
+    """Obtiene la imagen de portada de un día (nombre de carpeta insensible a mayúsculas)"""
     try:
-        folder_path = STORAGE_DIR / folder_name
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
         day_folder_path = folder_path / day_date
         
         if not day_folder_path.exists():
@@ -1711,11 +1729,10 @@ async def create_day_folder(
 
 @app.get("/folders/{folder_name}/days")
 async def get_folder_days(folder_name: str):
-    """Obtiene todos los días disponibles en una carpeta"""
+    """Obtiene todos los días disponibles en una carpeta (nombre insensible a mayúsculas)"""
     try:
-        folder_path = STORAGE_DIR / folder_name
-        
-        if not folder_path.exists():
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
             raise HTTPException(status_code=404, detail="La carpeta no existe")
         
         # Obtener subcarpetas (días)
@@ -1975,11 +1992,10 @@ async def start_indexing(
 
 @app.get("/photos/list")
 async def list_photos(folder_name: str = Query(...)):
-    """Lista todas las fotos en una carpeta"""
+    """Lista todas las fotos en una carpeta (nombre insensible a mayúsculas)"""
     try:
-        folder_path = STORAGE_DIR / folder_name
-        
-        if not folder_path.exists():
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
             raise HTTPException(status_code=404, detail="La carpeta no existe")
         
         photos = []
@@ -1994,7 +2010,7 @@ async def list_photos(folder_name: str = Query(...)):
         
         return {
             "status": "success",
-            "folder": folder_name,
+            "folder": folder_path.name,
             "photos": sorted(photos, key=lambda x: x["created_at"], reverse=True)
         }
     except HTTPException:
@@ -2067,9 +2083,11 @@ async def get_photo_preview(
     watermark: bool = Query(True),
     day: str = Query(None)
 ):
-    """Obtiene una foto con marca de agua para previsualización (imagen MarcaAgua.png o texto)"""
+    """Obtiene una foto con marca de agua para previsualización (carpeta insensible a mayúsculas)"""
     try:
-        folder_path = STORAGE_DIR / folder_name
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
         
         # Si se especifica un día, buscar en la subcarpeta del día
         if day:
@@ -2151,7 +2169,10 @@ async def get_photo_preview(
         print(traceback.format_exc())
         # Si falla el preview, intentar devolver la imagen original
         try:
-            photo_path = STORAGE_DIR / folder_name / filename
+            if day:
+                photo_path = folder_path / day / filename
+            else:
+                photo_path = folder_path / filename
             if photo_path.exists():
                 with open(photo_path, 'rb') as f:
                     content = f.read()
@@ -2168,9 +2189,11 @@ async def get_photo_view(
     folder_name: str = Query(...),
     filename: str = Query(...)
 ):
-    """Obtiene una foto original sin marca de agua (fallback)"""
+    """Obtiene una foto original sin marca de agua (carpeta insensible a mayúsculas)"""
     try:
-        folder_path = STORAGE_DIR / folder_name
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
         photo_path = folder_path / filename
         
         if not photo_path.exists():
