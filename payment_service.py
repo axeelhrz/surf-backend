@@ -1,3 +1,4 @@
+import os
 import stripe
 import json
 from pathlib import Path
@@ -13,9 +14,9 @@ from stripe_config import (
     TAX_RATE
 )
 
-# Directorio para almacenar registros de pagos
-PAYMENTS_DIR = Path(__file__).parent / "payments_storage"
-PAYMENTS_DIR.mkdir(exist_ok=True)
+# Directorio para almacenar registros de pagos (env para persistencia en Railway)
+PAYMENTS_DIR = Path(os.getenv("PAYMENTS_DIR", str(Path(__file__).parent / "payments_storage")))
+PAYMENTS_DIR.mkdir(exist_ok=True, parents=True)
 
 class PaymentService:
     """Servicio para manejar pagos con Stripe"""

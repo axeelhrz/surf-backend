@@ -1,6 +1,7 @@
 """
 Endpoints específicos para el panel de administración
 """
+import os
 from fastapi import APIRouter, HTTPException, Query
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -11,11 +12,11 @@ from embeddings_clustering import EmbeddingsClusteringSystem
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-# Directorio base
+# Directorios: mismos que main.py, vía env para persistencia en Railway (/data)
 BASE_DIR = Path(__file__).parent.absolute()
-STORAGE_DIR = BASE_DIR / "photos_storage"
-PAYMENTS_DIR = BASE_DIR / "payments_storage"
-EMBEDDINGS_DIR = BASE_DIR / "embeddings_storage"
+STORAGE_DIR = Path(os.getenv("STORAGE_DIR", str(BASE_DIR / "photos_storage")))
+PAYMENTS_DIR = Path(os.getenv("PAYMENTS_DIR", str(BASE_DIR / "payments_storage")))
+EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", str(BASE_DIR / "embeddings_storage")))
 
 # Inicializar sistema de clustering
 clustering_system = EmbeddingsClusteringSystem(
