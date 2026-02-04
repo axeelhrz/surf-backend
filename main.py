@@ -2116,16 +2116,19 @@ async def get_photo_preview(
             if watermark_path.exists():
                 try:
                     wm_img = Image.open(watermark_path).convert("RGBA")
-                    # Tamaño: ~40% del ancho de la foto, manteniendo proporción
-                    wm_max_width = int(width * 0.4)
-                    ratio = wm_max_width / wm_img.width
-                    wm_new_h = int(wm_img.height * ratio)
-                    wm_resized = wm_img.resize((wm_max_width, wm_new_h), Image.Resampling.LANCZOS)
-                    # Centrar la marca de agua
-                    x = (width - wm_resized.width) // 2
-                    y = (height - wm_resized.height) // 2
-                    # Pegar con transparencia: la foto es RGB, usamos el canal alpha del PNG como máscara
-                    watermarked.paste(wm_resized, (x, y), wm_resized.split()[3])
+                    # Tamaño de cada baldosa: ~25% del ancho para cubrir toda la foto en mosaico
+                    tile_width = max(int(width * 0.25), 80)
+                    ratio = tile_width / wm_img.width
+                    tile_height = int(wm_img.height * ratio)
+                    wm_resized = wm_img.resize((tile_width, tile_height), Image.Resampling.LANCZOS)
+                    alpha = wm_resized.split()[3]
+                    # Repetir la marca de agua en mosaico para cubrir toda la imagen
+                    step_x = max(tile_width // 2, 1)  # solapamiento para cobertura total
+                    step_y = max(tile_height // 2, 1)
+                    for y in range(-tile_height, height + tile_height, step_y):
+                        for x in range(-tile_width, width + tile_width, step_x):
+                            box = (x, y, x + tile_width, y + tile_height)
+                            watermarked.paste(wm_resized, (x, y), alpha)
                     output_image = watermarked
                 except Exception as e:
                     if DEBUG_MODE:
