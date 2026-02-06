@@ -120,8 +120,17 @@ EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", str(BASE_DIR / "embeddings_sto
 STORAGE_DIR.mkdir(exist_ok=True, parents=True)
 EMBEDDINGS_DIR.mkdir(exist_ok=True, parents=True)
 
-# Metadata de visualización por carpeta (fecha y texto personalizado; p. ej. OTRAS ESCUELAS)
+# Metadata de visualización por carpeta (fecha y texto personalizado)
 FOLDER_DISPLAY_METADATA_PATH = BASE_DIR / "folder_display_metadata.json"
+
+
+def _is_valid_day_folder(name: str) -> bool:
+    """Comprueba si el nombre de carpeta es una fecha válida (YYYY-MM-DD)."""
+    try:
+        datetime.fromisoformat(name)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def _resolve_folder_path(storage_dir: Path, folder_name: str) -> Optional[Path]:
@@ -1372,7 +1381,7 @@ async def get_folder_display_metadata():
 
 @app.put("/folders/display-metadata")
 async def set_folder_display_metadata(body: dict = Body(...)):
-    """Guarda fecha y/o texto para una carpeta (incluye OTRAS ESCUELAS aunque no exista en disco)."""
+    """Guarda fecha y/o texto para una carpeta (creada previamente en disco)."""
     try:
         folder_name = (body.get("folder_name") or "").strip()
         if not folder_name:
@@ -1552,18 +1561,59 @@ async def get_folder_cover(folder_name: str):
         if folder_path is None:
             raise HTTPException(status_code=404, detail="La carpeta no existe")
         
-        # Buscar archivo de portada
-        cover_path = folder_path / "cover.jpg"
+        cover_path = None
         
-        if not cover_path.exists():
-            # Intentar con otros nombres posibles
-            for ext in ['.png', '.jpeg', '.gif']:
-                alt_path = folder_path / f"cover{ext}"
-                if alt_path.exists():
-                    cover_path = alt_path
+        # 1. Revisar metadata.json por cover_image (por si tiene nombre personalizado)
+        metadata_path = folder_path / "metadata.json"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                cover_filename = metadata.get("cover_image")
+                if cover_filename:
+                    meta_cover = folder_path / cover_filename
+                    if meta_cover.exists() and meta_cover.is_file():
+                        cover_path = meta_cover
+            except Exception:
+                pass
+        
+        # 2. Buscar cover.jpg, cover.png, etc. en la raíz
+        if cover_path is None:
+            for name in ["cover.jpg", "cover.png", "cover.jpeg", "cover.gif"]:
+                candidate = folder_path / name
+                if candidate.exists() and candidate.is_file():
+                    cover_path = candidate
                     break
-            else:
-                raise HTTPException(status_code=404, detail="No hay portada asignada")
+        
+        # 3. Si no hay portada en raíz, usar la portada del primer día (subcarpeta)
+        days = []
+        if cover_path is None:
+            all_dirs = [d for d in folder_path.iterdir() if d.is_dir() and not d.name.startswith("_")]
+            days = sorted([d for d in all_dirs if _is_valid_day_folder(d.name)])
+            for day_dir in days:
+                day_cover = day_dir / "cover.jpg"
+                if not day_cover.exists():
+                    for ext in ['.png', '.jpeg', '.gif']:
+                        alt = day_dir / f"cover{ext}"
+                        if alt.exists():
+                            day_cover = alt
+                            break
+                if day_cover.exists():
+                    cover_path = day_cover
+                    break
+        
+        # 4. Si aún no hay portada, usar la primera foto del primer día
+        if cover_path is None:
+            for day_dir in days:
+                for f in sorted(day_dir.iterdir()):
+                    if f.is_file() and f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                        cover_path = f
+                        break
+                if cover_path is not None:
+                    break
+        
+        if cover_path is None or not cover_path.exists():
+            raise HTTPException(status_code=404, detail="No hay portada asignada")
         
         # Leer y devolver la imagen
         with open(cover_path, 'rb') as f:
@@ -1766,6 +1816,45 @@ async def get_folder_days(folder_name: str):
     except Exception as e:
         print(f"Error obteniendo días: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.delete("/folders/delete-day")
+async def delete_day_folder(
+    folder_name: str = Query(...),
+    day_date: str = Query(...)
+):
+    """Elimina un día (subcarpeta) y todas sus fotos"""
+    try:
+        folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
+        if folder_path is None:
+            raise HTTPException(status_code=404, detail="La carpeta no existe")
+
+        day_folder_path = folder_path / day_date
+        if not day_folder_path.exists() or not day_folder_path.is_dir():
+            raise HTTPException(status_code=404, detail=f"El día '{day_date}' no existe")
+
+        # Eliminar subcarpeta del día y su contenido
+        shutil.rmtree(day_folder_path)
+
+        # Actualizar metadata de la carpeta (quitar el día de metadata["days"])
+        metadata_path = folder_path / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            if "days" in metadata and day_date in metadata["days"]:
+                metadata["days"] = [d for d in metadata["days"] if d != day_date]
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+
+        return {
+            "status": "success",
+            "message": f"Día '{day_date}' eliminado de la carpeta '{folder_name}'"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error eliminando día: {e}")
+        raise HTTPException(status_code=500, detail=f"Error eliminando día: {str(e)}")
+
 
 @app.delete("/folders/delete")
 async def delete_folder(folder_name: str = Query(...)):
@@ -2081,9 +2170,11 @@ async def get_photo_preview(
     folder_name: str = Query(...),
     filename: str = Query(...),
     watermark: bool = Query(True),
-    day: str = Query(None)
+    day: str = Query(None),
+    max_width: int = Query(None, ge=100, le=2000)
 ):
-    """Obtiene una foto con marca de agua para previsualización (carpeta insensible a mayúsculas)"""
+    """Obtiene una foto con marca de agua para previsualización (carpeta insensible a mayúsculas).
+    max_width opcional: redimensiona para thumbnails más rápidos (ej. 400 para grid)."""
     try:
         folder_path = _resolve_folder_path(STORAGE_DIR, folder_name)
         if folder_path is None:
@@ -2103,6 +2194,12 @@ async def get_photo_preview(
         # Leer la imagen
         image = Image.open(photo_path)
         
+        # Redimensionar para thumbnail si se pide (acelera carga en grid)
+        if max_width and image.width > max_width:
+            ratio = max_width / image.width
+            new_h = int(image.height * ratio)
+            image = image.resize((max_width, new_h), Image.Resampling.LANCZOS)
+        
         # Agregar marca de agua si se solicita (imagen MarcaAgua.png o fallback a texto)
         if watermark:
             # Convertir a RGB para trabajar
@@ -2116,18 +2213,16 @@ async def get_photo_preview(
             if watermark_path.exists():
                 try:
                     wm_img = Image.open(watermark_path).convert("RGBA")
-                    # Tamaño de cada baldosa: ~45% del ancho para que se vea grande y legible
-                    tile_width = max(int(width * 0.45), 120)
-                    ratio = tile_width / wm_img.width
-                    tile_height = int(wm_img.height * ratio)
-                    wm_resized = wm_img.resize((tile_width, tile_height), Image.Resampling.LANCZOS)
+                    # Una sola marca de agua que se adapta al tamaño de la foto (~25% del ancho)
+                    wm_width = max(int(width * 0.25), 80)
+                    ratio = wm_width / wm_img.width
+                    wm_height = int(wm_img.height * ratio)
+                    wm_resized = wm_img.resize((wm_width, wm_height), Image.Resampling.LANCZOS)
                     alpha = wm_resized.split()[3]
-                    # Paso ~85% del tamaño: cubre toda la foto pero sin amontonar (más separados)
-                    step_x = max(int(tile_width * 0.85), 1)
-                    step_y = max(int(tile_height * 0.85), 1)
-                    for y in range(-tile_height, height + tile_height, step_y):
-                        for x in range(-tile_width, width + tile_width, step_x):
-                            watermarked.paste(wm_resized, (x, y), alpha)
+                    # Centrada en la foto
+                    x = (width - wm_width) // 2
+                    y = (height - wm_height) // 2
+                    watermarked.paste(wm_resized, (x, y), alpha)
                     output_image = watermarked
                 except Exception as e:
                     if DEBUG_MODE:
