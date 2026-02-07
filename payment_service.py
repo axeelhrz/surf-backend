@@ -47,7 +47,7 @@ class PaymentService:
             for item in items:
                 line_items.append({
                     "price_data": {
-                        "currency": "usd",
+                        "currency": "eur",
                         "product_data": {
                             "name": f"Foto: {item.filename}",
                             "description": f"Escuela: {item.school} | Fecha: {item.date}",
