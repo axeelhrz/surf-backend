@@ -2213,29 +2213,16 @@ async def get_photo_preview(
             if watermark_path.exists():
                 try:
                     wm_img = Image.open(watermark_path).convert("RGBA")
-                    # Si la imagen es un mosaico/tiled (8x7 o similar), extraer UNA sola unidad
-                    wm_w, wm_h = wm_img.size
-                    cols, rows = 8, 7
-                    if wm_w >= 400 and wm_h >= 300:  # Solo si parece mosaico (imagen grande)
-                        unit_w = wm_w // cols
-                        unit_h = wm_h // rows
-                        cx, cy = cols // 2, rows // 2
-                        left = cx * unit_w
-                        top = cy * unit_h
-                        wm_img = wm_img.crop((left, top, left + unit_w, top + unit_h))
-                    # Una sola marca de agua: tamaño adaptado al de la foto (~40% del lado menor)
-                    dim = min(width, height)
-                    wm_size = max(int(dim * 0.40), 100)
-                    ratio = wm_size / wm_img.width
-                    wm_width = int(wm_img.width * ratio)
-                    wm_height = int(wm_img.height * ratio)
-                    wm_resized = wm_img.resize((wm_width, wm_height), Image.Resampling.LANCZOS)
-                    alpha = wm_resized.split()[3]
-                    # Centrada en la foto
-                    x = (width - wm_width) // 2
-                    y = (height - wm_height) // 2
-                    watermarked.paste(wm_resized, (x, y), alpha)
-                    output_image = watermarked
+                    # Marca de agua de punta a punta: adaptada al tamaño completo de la foto
+                    wm_resized = wm_img.resize((width, height), Image.Resampling.LANCZOS)
+                    # Reducir opacidad para que la foto se vea a través (~25%)
+                    r, g, b, a = wm_resized.split()
+                    a_mod = a.point(lambda x: int(x * 0.25))
+                    wm_resized = Image.merge("RGBA", (r, g, b, a_mod))
+                    # Convertir foto a RGBA temporalmente para composite
+                    watermarked_rgba = watermarked.convert("RGBA")
+                    watermarked_rgba = Image.alpha_composite(watermarked_rgba, wm_resized)
+                    output_image = watermarked_rgba.convert("RGB")
                 except Exception as e:
                     if DEBUG_MODE:
                         print(f"⚠️ Marca de agua por imagen falló ({e}), usando texto")
