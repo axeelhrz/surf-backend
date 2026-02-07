@@ -1,9 +1,34 @@
 """
 Endpoints de Stripe para manejo de pagos
 """
-from fastapi import APIRouter, HTTPException
+import io
+import os
+import zipfile
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
 from payment_models import CheckoutRequest
 from payment_service import PaymentService
+
+# STORAGE_DIR (mismo que main.py, sin importar main para evitar imports circulares)
+BASE_DIR = Path(__file__).resolve().parent.parent
+STORAGE_DIR = Path(os.getenv("STORAGE_DIR", str(BASE_DIR / "photos_storage")))
+
+
+def _resolve_folder_path(storage_dir: Path, folder_name: str) -> Optional[Path]:
+    """Resuelve el nombre de carpeta de forma insensible a mayúsculas/minúsculas."""
+    direct = storage_dir / folder_name
+    if direct.exists() and direct.is_dir():
+        return direct
+    name_lower = folder_name.lower()
+    for p in storage_dir.iterdir():
+        if p.is_dir() and p.name.lower() == name_lower:
+            return p
+    return None
+
 
 router = APIRouter(prefix="/stripe", tags=["stripe"])
 
@@ -189,4 +214,80 @@ async def get_success_details(session_id: str = None, test: str = None):
         raise
     except Exception as e:
         print(f"❌ Error success-details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/download-zip")
+async def download_zip(session_id: str = Query(..., description="ID de la sesión de Stripe")):
+    """
+    Descarga un ZIP con todas las fotos compradas (sin marca de agua).
+    Requiere que el pago esté completado.
+    """
+    try:
+        data = PaymentService.get_success_details(session_id)
+        if not data:
+            raise HTTPException(
+                status_code=404,
+                detail="Pago no encontrado o no completado"
+            )
+        items = data.get("items", [])
+        if not items:
+            raise HTTPException(
+                status_code=400,
+                detail="No hay fotos para descargar"
+            )
+
+        buffer = io.BytesIO()
+        seen = set()  # Evitar duplicados si hay filenames repetidos en distintas carpetas
+
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in items:
+                school = item.get("school", "")
+                date = item.get("date", "")
+                filename = item.get("filename", "")
+                if not school or not filename:
+                    continue
+
+                folder_path = _resolve_folder_path(STORAGE_DIR, school)
+                if folder_path is None:
+                    continue
+                if date:
+                    photo_path = folder_path / date / filename
+                else:
+                    photo_path = folder_path / filename
+
+                if not photo_path.exists() or not photo_path.is_file():
+                    continue
+
+                # Nombre único en el ZIP: school_date_filename o school_filename
+                arcname = f"{school}_{date}_{filename}".replace("__", "_").strip("_") if date else f"{school}_{filename}"
+                if arcname in seen:
+                    idx = 1
+                    base, ext = arcname.rsplit(".", 1) if "." in arcname else (arcname, "")
+                    while arcname in seen:
+                        arcname = f"{base}_{idx}.{ext}" if ext else f"{base}_{idx}"
+                        idx += 1
+                seen.add(arcname)
+
+                zf.write(photo_path, arcname)
+
+        if len(seen) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No se encontraron archivos de foto en el almacenamiento"
+            )
+
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": 'attachment; filename="surf-photos.zip"'
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error download-zip: {e}")
         raise HTTPException(status_code=500, detail=str(e))
