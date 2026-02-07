@@ -2223,9 +2223,9 @@ async def get_photo_preview(
                         left = cx * unit_w
                         top = cy * unit_h
                         wm_img = wm_img.crop((left, top, left + unit_w, top + unit_h))
-                    # Una sola marca de agua: tamaño adaptado al de la foto (~25% del lado menor)
+                    # Una sola marca de agua: tamaño adaptado al de la foto (~40% del lado menor)
                     dim = min(width, height)
-                    wm_size = max(int(dim * 0.25), 60)
+                    wm_size = max(int(dim * 0.40), 100)
                     ratio = wm_size / wm_img.width
                     wm_width = int(wm_img.width * ratio)
                     wm_height = int(wm_img.height * ratio)
