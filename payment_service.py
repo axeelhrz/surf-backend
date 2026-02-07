@@ -16,7 +16,10 @@ from stripe_config import (
 
 # Directorio para almacenar registros de pagos (env para persistencia en Railway)
 PAYMENTS_DIR = Path(os.getenv("PAYMENTS_DIR", str(Path(__file__).parent / "payments_storage")))
-PAYMENTS_DIR.mkdir(exist_ok=True, parents=True)
+try:
+    PAYMENTS_DIR.mkdir(exist_ok=True, parents=True)
+except OSError as e:
+    print(f"⚠️ No se pudo crear PAYMENTS_DIR {PAYMENTS_DIR}: {e}")
 
 class PaymentService:
     """Servicio para manejar pagos con Stripe"""
