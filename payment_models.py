@@ -10,6 +10,7 @@ class PhotoItem(BaseModel):
     date: str
     price: float
     thumbnail: Optional[str] = None
+    files: Optional[List[str]] = None  # Para packs: lista de nombres de archivo reales
 
 class CheckoutRequest(BaseModel):
     """Modelo para solicitud de checkout"""

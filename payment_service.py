@@ -334,13 +334,34 @@ class PaymentService:
             session = stripe.checkout.Session.retrieve(session_id)
             if session.payment_status != "paid":
                 return None
+            def expand_pack_items(items_list):
+                expanded = []
+                for it in items_list or []:
+                    files_list = it.get("files") if isinstance(it, dict) else None
+                    if files_list and isinstance(files_list, list):
+                        school = it.get("school", "")
+                        date = it.get("date", "")
+                        for f in files_list:
+                            expanded.append({
+                                "id": f"{school}_{date}_{f}".replace("__", "_").strip("_"),
+                                "filename": f,
+                                "school": school,
+                                "date": date,
+                                "price": 0,
+                                "thumbnail": it.get("thumbnail"),
+                            })
+                    else:
+                        expanded.append(it)
+                return expanded
+
             pending = PaymentService._load_pending_session(session_id)
             if not pending:
                 # Ya confirmado antes: buscar pago existente por stripe_session_id
                 payments = PaymentService.get_all_payments()
                 for p in payments:
                     if p.get("stripe_session_id") == session_id:
-                        return {"payment": p, "items": p.get("items", [])}
+                        items_raw = p.get("items", [])
+                        return {"payment": p, "items": expand_pack_items(items_raw)}
                 return None
             items_data = pending.get("items", [])
             items = [PhotoItem(**it) for it in items_data]
@@ -360,7 +381,7 @@ class PaymentService:
             }
             PaymentService.save_payment_record(payment_record)
             PaymentService._remove_pending_session(session_id)
-            return {"payment": payment_record, "items": items_data}
+            return {"payment": payment_record, "items": expand_pack_items(items_data)}
         except Exception as e:
             print(f"❌ Error get_success_details: {e}")
             return None
