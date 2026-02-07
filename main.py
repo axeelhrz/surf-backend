@@ -2213,9 +2213,21 @@ async def get_photo_preview(
             if watermark_path.exists():
                 try:
                     wm_img = Image.open(watermark_path).convert("RGBA")
-                    # Una sola marca de agua que se adapta al tamaño de la foto (~25% del ancho)
-                    wm_width = max(int(width * 0.25), 80)
-                    ratio = wm_width / wm_img.width
+                    # Si la imagen es un mosaico/tiled (8x7 o similar), extraer UNA sola unidad
+                    wm_w, wm_h = wm_img.size
+                    cols, rows = 8, 7
+                    if wm_w >= 400 and wm_h >= 300:  # Solo si parece mosaico (imagen grande)
+                        unit_w = wm_w // cols
+                        unit_h = wm_h // rows
+                        cx, cy = cols // 2, rows // 2
+                        left = cx * unit_w
+                        top = cy * unit_h
+                        wm_img = wm_img.crop((left, top, left + unit_w, top + unit_h))
+                    # Una sola marca de agua: tamaño adaptado al de la foto (~25% del lado menor)
+                    dim = min(width, height)
+                    wm_size = max(int(dim * 0.25), 60)
+                    ratio = wm_size / wm_img.width
+                    wm_width = int(wm_img.width * ratio)
                     wm_height = int(wm_img.height * ratio)
                     wm_resized = wm_img.resize((wm_width, wm_height), Image.Resampling.LANCZOS)
                     alpha = wm_resized.split()[3]
